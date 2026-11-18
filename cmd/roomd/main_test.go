@@ -14,6 +14,7 @@ import (
 
 	"github.com/ziliding/hermes-roomd/internal/config"
 	"github.com/ziliding/hermes-roomd/internal/hermes"
+	"github.com/ziliding/hermes-roomd/internal/media"
 	"github.com/ziliding/hermes-roomd/internal/memory"
 	"github.com/ziliding/hermes-roomd/internal/room"
 	"github.com/ziliding/hermes-roomd/internal/transcript"
@@ -23,12 +24,14 @@ type nopPoster struct{}
 
 func (nopPoster) Send(context.Context, string, string) (string, error)       { return "$x", nil }
 func (nopPoster) SendNotice(context.Context, string, string) (string, error) { return "$n", nil }
-
-type nopHermes struct{}
-
-func (nopHermes) Complete(context.Context, string, string, string) (hermes.Reply, error) {
-	return hermes.Reply{Text: "ok"}, nil
+func (nopPoster) SendReply(context.Context, string, string, string) (string, error) {
+	return "$r", nil
 }
+func (nopPoster) SendImage(context.Context, string, media.Image, string) (string, error) {
+	return "$i", nil
+}
+func (nopPoster) React(context.Context, string, string, string) error       { return nil }
+func (nopPoster) Typing(context.Context, string, bool, time.Duration) error { return nil }
 
 const cfgYAML = `
 homeserver: http://127.0.0.1:8008
@@ -85,11 +88,11 @@ func TestBuildRoomsPerRoomCastAndBank(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	posters, completers := map[string]room.Poster{}, map[string]room.Completer{}
+	posters, runners := map[string]room.Poster{}, map[string]room.Runner{}
 	for _, k := range cfg.BotKeys() {
-		posters[k], completers[k] = nopPoster{}, nopHermes{}
+		posters[k], runners[k] = nopPoster{}, hermes.New("http://h/p/"+k, "k", "")
 	}
-	specs, retainers := buildRooms(cfg, store, posters, completers, 1, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	specs, retainers := buildRooms(cfg, store, posters, runners, 1, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	if len(specs) != 2 || len(retainers) != 2 {
 		t.Fatalf("specs %d retainers %d", len(specs), len(retainers))
@@ -104,6 +107,9 @@ func TestBuildRoomsPerRoomCastAndBank(t *testing.T) {
 	}
 	if !reflect.DeepEqual(aBots, []string{"ada", "cleo"}) || !reflect.DeepEqual(bBots, []string{"ada", "bram"}) {
 		t.Fatalf("casts %v / %v", aBots, bBots)
+	}
+	if a.BackgroundAfter != config.DefaultBackgroundAfter || b.BackgroundAfter != config.DefaultBackgroundAfter {
+		t.Fatalf("background_after %v / %v", a.BackgroundAfter, b.BackgroundAfter)
 	}
 	if a.Notifier != "cleo" || b.Notifier != "ada" {
 		t.Fatalf("notifiers %q / %q", a.Notifier, b.Notifier)

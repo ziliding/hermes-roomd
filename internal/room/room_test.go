@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/ziliding/hermes-roomd/internal/hermes"
+	"github.com/ziliding/hermes-roomd/internal/hermes/hermestest"
 	"github.com/ziliding/hermes-roomd/internal/matrixio"
+	"github.com/ziliding/hermes-roomd/internal/media"
 	"github.com/ziliding/hermes-roomd/internal/roster"
 	"github.com/ziliding/hermes-roomd/internal/transcript"
 	"github.com/ziliding/hermes-roomd/internal/turns"
@@ -20,43 +22,70 @@ import (
 
 const roomID = "!r:example.com"
 
-type call struct{ bot, session, system, delta, raw string }
+type call struct{ bot, session, system, delta, raw, run string }
 
-// harness wires an Orchestrator to fake Hermes profiles and fake posters.
+// harness wires an Orchestrator to a fake Hermes Runs server (through the
+// real hermes.Client) and fake posters.
 type harness struct {
 	t       *testing.T
+	ctx     context.Context
 	o       *Orchestrator
+	srv     *hermestest.Server
 	mu      sync.Mutex
 	calls   []call
-	posts   []string // "bot: text"
+	posts   []string // "bot: text" (replies: "bot: text ↩ $event")
 	notices []string // "bot: text"
-	reply   func(bot string, n int) string
-	gate    chan struct{} // if set, Complete blocks until it can receive
-	seq     int
+	reacts  []string // "bot: $event key"
+	typing  []string // "bot: on" / "bot: off"
+	// reply decides each run's output; it runs in the run's own goroutine
+	// and may block to make the run slow. "ERR" fails the run, "HANG" never
+	// finishes it, "PARTIAL:<text>" ends it as an unfinished turn.
+	reply func(bot string, n int) string
+	gate  chan struct{} // if set, every run waits until it can receive
+	// keepSteers: runs end with every accepted steer still in pending_steer.
+	keepSteers bool
+	imageFail  bool // SendImage fails
+	seq        int
 }
 
-type fakeHermes struct {
-	h   *harness
-	bot string
+type harnessOpts struct {
+	maxTurns        int
+	backgroundAfter time.Duration
+	runTimeout      time.Duration
+	typingEvery     time.Duration
+	decider         func(bots []string) turns.Decider // default: the plain rules
 }
 
-func (f fakeHermes) Complete(_ context.Context, sid, system, delta string) (hermes.Reply, error) {
-	f.h.mu.Lock()
-	f.h.calls = append(f.h.calls, call{f.bot, sid, system, unframe(f.h.t, delta), delta})
-	n := len(f.h.calls)
-	gate := f.h.gate
-	f.h.mu.Unlock()
-	if gate != nil {
-		<-gate
+// startServer starts the fake Runs server; runs follow h.reply.
+func (h *harness) startServer() {
+	h.srv = hermestest.New(h.t)
+	ctx, cancel := context.WithCancel(context.Background())
+	h.t.Cleanup(cancel) // runs before the server closes: background runs stop polling
+	h.ctx = ctx
+	h.srv.Handle = func(s *hermestest.Server, r hermestest.Run) {
+		h.mu.Lock()
+		h.calls = append(h.calls, call{r.Profile, r.SessionID, r.Instructions, unframe(h.t, r.Input), r.Input, r.ID})
+		n, gate, reply, keep := len(h.calls), h.gate, h.reply, h.keepSteers
+		h.mu.Unlock()
+		if gate != nil {
+			<-gate
+		}
+		switch text := reply(r.Profile, n); {
+		case strings.HasPrefix(text, "PARTIAL:"):
+			s.FinishPartial(r.ID, strings.TrimPrefix(text, "PARTIAL:"))
+		case text == "HANG":
+		case text == "ERR":
+			s.Finish(r.ID, "failed", "boom", !keep)
+		default:
+			s.Finish(r.ID, "completed", text, !keep)
+		}
 	}
-	text := f.h.reply(f.bot, n)
-	if text == "ERR" {
-		return hermes.Reply{}, fmt.Errorf("%w: boom", hermes.ErrNoReply)
-	}
-	if text == "[SILENT]" {
-		return hermes.Reply{Silent: true}, nil
-	}
-	return hermes.Reply{Text: text, FinishReason: "stop"}, nil
+}
+
+// runner is bot's Hermes profile on the fake server.
+func (h *harness) runner(bot string) Runner {
+	c := hermes.New(h.srv.BaseURL(bot), "k", "")
+	return c
 }
 
 // unframe returns the attributed lines inside Frame's wrapper.
@@ -89,6 +118,29 @@ func (p fakePoster) Send(_ context.Context, _ string, text string) (string, erro
 	return fmt.Sprintf("$bot%d", p.h.seq), nil
 }
 
+func (p fakePoster) SendReply(_ context.Context, _ string, text, inReplyTo string) (string, error) {
+	p.h.mu.Lock()
+	defer p.h.mu.Unlock()
+	p.h.posts = append(p.h.posts, p.bot+": "+text+" ↩ "+inReplyTo)
+	p.h.seq++
+	return fmt.Sprintf("$bot%d", p.h.seq), nil
+}
+
+func (p fakePoster) SendImage(_ context.Context, _ string, img media.Image, inReplyTo string) (string, error) {
+	p.h.mu.Lock()
+	defer p.h.mu.Unlock()
+	if p.h.imageFail {
+		return "", fmt.Errorf("M_TOO_LARGE")
+	}
+	post := fmt.Sprintf("%s: <image %s %dB>", p.bot, img.MIME, len(img.Data))
+	if inReplyTo != "" {
+		post += " ↩ " + inReplyTo
+	}
+	p.h.posts = append(p.h.posts, post)
+	p.h.seq++
+	return fmt.Sprintf("$img%d", p.h.seq), nil
+}
+
 func (p fakePoster) SendNotice(_ context.Context, _ string, text string) (string, error) {
 	p.h.mu.Lock()
 	defer p.h.mu.Unlock()
@@ -97,7 +149,29 @@ func (p fakePoster) SendNotice(_ context.Context, _ string, text string) (string
 	return fmt.Sprintf("$notice%d", p.h.seq), nil
 }
 
+func (p fakePoster) React(_ context.Context, _ string, eventID, key string) error {
+	p.h.mu.Lock()
+	defer p.h.mu.Unlock()
+	p.h.reacts = append(p.h.reacts, p.bot+": "+eventID+" "+key)
+	return nil
+}
+
+func (p fakePoster) Typing(_ context.Context, _ string, on bool, _ time.Duration) error {
+	p.h.mu.Lock()
+	defer p.h.mu.Unlock()
+	state := "off"
+	if on {
+		state = "on"
+	}
+	p.h.typing = append(p.h.typing, p.bot+": "+state)
+	return nil
+}
+
 func newHarness(t *testing.T, maxTurns int, reply func(bot string, n int) string) *harness {
+	return newHarnessWith(t, harnessOpts{maxTurns: maxTurns}, reply)
+}
+
+func newHarnessWith(t *testing.T, ho harnessOpts, reply func(bot string, n int) string) *harness {
 	t.Helper()
 	store, err := transcript.Open(context.Background(), ":memory:")
 	if err != nil {
@@ -109,15 +183,21 @@ func newHarness(t *testing.T, maxTurns int, reply func(bot string, n int) string
 		{Key: "cleo", Display: "Cleo", MXID: "@cleo:z"},
 	})
 	h := &harness{t: t, reply: reply}
+	h.startServer()
 	var bots []*Bot
 	for _, k := range []string{"ada", "cleo"} {
-		bots = append(bots, &Bot{Key: k, Poster: fakePoster{h, k}, Hermes: fakeHermes{h, k}, System: "SYS-" + k})
+		bots = append(bots, &Bot{Key: k, Poster: fakePoster{h, k}, Hermes: h.runner(k), System: "SYS-" + k})
+	}
+	var decider turns.Decider = turns.NewRules([]string{"ada", "cleo"}, ho.maxTurns, rand.New(rand.NewPCG(1, 1)))
+	if ho.decider != nil {
+		decider = ho.decider([]string{"ada", "cleo"})
 	}
 	h.o = New(Options{
-		Store: store, Roster: r,
-		Decider: turns.NewRules([]string{"ada", "cleo"}, maxTurns, rand.New(rand.NewPCG(1, 1))),
-		Bots:    bots, Rooms: []string{roomID}, MaxDeltaLines: 40,
-		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Store: store, Roster: r, Decider: decider,
+		Bots: bots, Rooms: []string{roomID}, MaxDeltaLines: 40,
+		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		PollInterval: 2 * time.Millisecond, RunTimeout: ho.runTimeout,
+		TypingEvery: or0(ho.typingEvery, time.Hour), BackgroundAfter: ho.backgroundAfter,
 	})
 	return h
 }
@@ -130,13 +210,14 @@ func (h *harness) user(body string) matrixio.Message {
 }
 
 // runOne records a user message and runs its chain synchronously.
-func (h *harness) runOne(body string) {
-	ctx := context.Background()
-	h.o.Handle(ctx, h.user(body))
+func (h *harness) runOne(body string) matrixio.Message {
+	m := h.user(body)
+	h.o.Handle(h.ctx, m)
 	w := h.o.rooms[roomID]
 	q := <-w.inbox
 	w.state.UserSpoke()
-	h.o.chain(ctx, w, q)
+	h.o.chain(h.ctx, w, q)
+	return m
 }
 
 func TestChainNamedBotThenOtherThenStop(t *testing.T) {

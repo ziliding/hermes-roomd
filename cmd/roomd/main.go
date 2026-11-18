@@ -77,7 +77,7 @@ func run(ctx context.Context, cfgPath string, log *slog.Logger) error {
 			return fmt.Errorf("bot %s: %w", k, err)
 		}
 		senders[k] = s
-		hermesFor[k] = hermes.New(b.Hermes.BaseURL, b.Hermes.Key, b.Hermes.Model, cfg.HermesTimeout)
+		hermesFor[k] = hermes.New(b.Hermes.BaseURL, b.Hermes.Key, b.Hermes.Model)
 	}
 
 	// One /sync loop per listener bot, for the rooms that bot listens to.
@@ -95,12 +95,12 @@ func run(ctx context.Context, cfgPath string, log *slog.Logger) error {
 	}
 
 	posters := map[string]room.Poster{}
-	completers := map[string]room.Completer{}
+	runners := map[string]room.Runner{}
 	for _, k := range keys {
-		posters[k], completers[k] = senders[k], hermesFor[k]
+		posters[k], runners[k] = senders[k], hermesFor[k]
 	}
-	specs, retainers := buildRooms(cfg, store, posters, completers, uint64(time.Now().UnixNano()), log)
-	orch := room.New(room.Options{Store: store, RoomSpecs: specs, MaxDeltaLines: cfg.MaxDeltaLines, Log: log})
+	specs, retainers := buildRooms(cfg, store, posters, runners, uint64(time.Now().UnixNano()), log)
+	orch := room.New(room.Options{Store: store, RoomSpecs: specs, MaxDeltaLines: cfg.MaxDeltaLines, Log: log, RunTimeout: cfg.HermesTimeout})
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -148,7 +148,7 @@ func run(ctx context.Context, cfgPath string, log *slog.Logger) error {
 // config: one roster per room (the user plus that room's bots), the room's
 // rules rendered per bot, a decider over that cast with the room's
 // max_bot_turns, and recall/retain against the room's own bank.
-func buildRooms(cfg *config.Config, store *transcript.Store, posters map[string]room.Poster, completers map[string]room.Completer,
+func buildRooms(cfg *config.Config, store *transcript.Store, posters map[string]room.Poster, runners map[string]room.Runner,
 	seed uint64, log *slog.Logger) ([]room.RoomSpec, []*memory.Retainer) {
 	blurbs := map[string]string{}
 	for k, b := range cfg.Bots {
@@ -167,7 +167,7 @@ func buildRooms(cfg *config.Config, store *transcript.Store, posters map[string]
 		var bots []*room.Bot
 		for _, k := range rc.Bots {
 			bots = append(bots, &room.Bot{
-				Key: k, Poster: posters[k], Hermes: completers[k],
+				Key: k, Poster: posters[k], Hermes: runners[k],
 				System: room.SystemPrompt(rc.Rules, r, k, blurbs), // per room: the room's rules and cast
 			})
 		}
@@ -181,7 +181,8 @@ func buildRooms(cfg *config.Config, store *transcript.Store, posters map[string]
 				Log:      log,
 			})
 		}
-		spec := room.RoomSpec{ID: rc.ID, Roster: r, Decider: decider, Bots: bots, Notifier: rc.Listener}
+		spec := room.RoomSpec{ID: rc.ID, Roster: r, Decider: decider, Bots: bots, Notifier: rc.Listener,
+			BackgroundAfter: time.Duration(*rc.BackgroundAfter)}
 
 		if mc := cfg.Memory; mc.Enabled {
 			eff := cfg.MemoryFor(rc)
@@ -215,7 +216,7 @@ func buildRooms(cfg *config.Config, store *transcript.Store, posters map[string]
 		}
 		specs = append(specs, spec)
 		log.Info("room", "room", rc.Label(), "id", rc.ID, "bots", strings.Join(rc.Bots, ","), "listener", rc.Listener,
-			"max_bot_turns", rc.MaxBotTurns, "custom_rules", rc.RulesFile != "")
+			"max_bot_turns", rc.MaxBotTurns, "background_after", time.Duration(*rc.BackgroundAfter), "custom_rules", rc.RulesFile != "")
 	}
 	return specs, retainers
 }

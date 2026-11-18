@@ -1,10 +1,18 @@
 // Package room is the orchestrator: it records every room message, and for
 // each message from the user runs one serialized chain of bot turns
-// (decide → build delta → call Hermes → post as the bot → decide again).
+// (decide → build delta → start a Hermes run → post as the bot → decide
+// again).
 //
 // One worker goroutine per room means one turn in flight per room. A user
 // message that arrives mid-turn lets the in-flight reply finish and post,
 // then stops the chain; the worker then handles that newest user message.
+//
+// A run that is still going after the room's background_after hands off to
+// the background: the listener posts one notice, the bot is marked busy in
+// that room (never picked for a turn), and the room goes on. When the run
+// ends, its result is posted as a reply to the message that asked for it,
+// without starting a chain. A user message that names a busy bot is steered
+// into its run instead of starting a chain.
 //
 // The user's commands (/reset, /explain) are never recorded as conversation.
 // They go through the same worker queue, so they never race a turn, and they
@@ -28,28 +36,40 @@ import (
 	"github.com/ziliding/hermes-roomd/internal/contextbuild"
 	"github.com/ziliding/hermes-roomd/internal/hermes"
 	"github.com/ziliding/hermes-roomd/internal/matrixio"
+	"github.com/ziliding/hermes-roomd/internal/media"
 	"github.com/ziliding/hermes-roomd/internal/roster"
 	"github.com/ziliding/hermes-roomd/internal/transcript"
 	"github.com/ziliding/hermes-roomd/internal/turns"
 )
 
-// Poster posts text into a room as one bot and returns the event id.
-// SendNotice posts roomd's own status text, tagged so the listener never
-// records its echo as conversation (see matrixio.SendNotice).
+// Poster posts into a room as one bot. SendNotice posts roomd's own status
+// text, tagged so the listener never records its echo as conversation (see
+// matrixio.SendNotice).
 type Poster interface {
 	Send(ctx context.Context, roomID, text string) (string, error)
+	SendReply(ctx context.Context, roomID, text, inReplyTo string) (string, error)
+	// SendImage uploads an image as the bot and posts it as an m.image
+	// (a reply to inReplyTo when that is set).
+	SendImage(ctx context.Context, roomID string, img media.Image, inReplyTo string) (string, error)
 	SendNotice(ctx context.Context, roomID, text string) (string, error)
+	React(ctx context.Context, roomID, eventID, key string) error
+	Typing(ctx context.Context, roomID string, typing bool, timeout time.Duration) error
 }
 
-// Completer calls one bot's Hermes profile.
-type Completer interface {
-	Complete(ctx context.Context, sessionID, system, delta string) (hermes.Reply, error)
+// Runner drives runs on one bot's Hermes profile (see hermes.Client).
+type Runner interface {
+	Start(ctx context.Context, sessionID, instructions, input string) (string, error)
+	Status(ctx context.Context, runID string) (hermes.Run, error)
+	Steer(ctx context.Context, runID, text string) error
+	Stop(ctx context.Context, runID string) error
+	ResolveUnknown(ctx context.Context, run hermes.Run) error
 }
 
 // Memory supplies the recollections block for one bot turn ("" for none)
 // and the ids of the memories in it. It must never fail a turn: errors are
-// its own to log. Delivered is called only after the Hermes call succeeded
-// (Hermes then holds the block), so a failed call offers them again.
+// its own to log. Delivered is called only after the run succeeded (Hermes
+// then holds the block), so a failed run offers them again. Delivered may be
+// called from a background goroutine.
 type Memory interface {
 	Block(ctx context.Context, roomID, sessionID string) (string, []string)
 	Delivered(sessionID string, ids []string)
@@ -59,9 +79,19 @@ type Memory interface {
 type Bot struct {
 	Key    string
 	Poster Poster
-	Hermes Completer
+	Hermes Runner
 	System string // byte-identical on every call (keeps Hermes' prompt cache warm)
 }
+
+// Defaults for Options left zero.
+const (
+	DefaultRunTimeout    = 5 * time.Minute
+	DefaultPollInterval  = time.Second
+	DefaultTypingTimeout = 30 * time.Second
+	DefaultTypingEvery   = 25 * time.Second
+	// SteerAck is the reaction a bot puts on a message steered into its run.
+	SteerAck = "✓"
+)
 
 // Orchestrator owns all configured rooms.
 type Orchestrator struct {
@@ -70,25 +100,34 @@ type Orchestrator struct {
 	log      *slog.Logger
 	now      func() time.Time
 
+	runTimeout    time.Duration
+	pollInterval  time.Duration
+	typingTimeout time.Duration
+	typingEvery   time.Duration
+
 	rooms map[string]*worker
-	wg    sync.WaitGroup
+	wg    sync.WaitGroup // room workers and their runs
 }
 
 // worker is one room: its cast and settings, plus its serialized turn queue.
 type worker struct {
-	id       string
-	roster   *roster.Roster // the user plus this room's cast only
-	builder  *contextbuild.Builder
-	decider  turns.Decider
-	memory   Memory // nil: no group memory in this room
-	bots     map[string]*Bot
-	botKeys  []string // this room's cast, stable order
-	notifier string   // bot key that posts roomd's notices in this room
+	id              string
+	roster          *roster.Roster // the user plus this room's cast only
+	builder         *contextbuild.Builder
+	decider         turns.Decider
+	memory          Memory // nil: no group memory in this room
+	bots            map[string]*Bot
+	botKeys         []string      // this room's cast, stable order
+	notifier        string        // bot key that posts roomd's notices in this room
+	backgroundAfter time.Duration // 0: never hand a run off to the background
 
 	inbox     chan queued
 	userEpoch atomic.Int64 // bumped by every user message and command as it arrives
 	resets    atomic.Int64 // bumped by every /reset as it arrives
 	state     turns.State  // touched only by the worker goroutine
+
+	mu   sync.Mutex
+	busy map[string]*job // bot key -> its background run
 }
 
 // RoomSpec is one room's cast and settings. Each Bot's System is that
@@ -103,29 +142,43 @@ type RoomSpec struct {
 	// room (its listener). Default: the first bot.
 	Notifier string
 	Memory   Memory // nil: no group memory in this room
+	// BackgroundAfter hands a run that is still going after this long to the
+	// background. 0 disables it: the room waits for every run.
+	BackgroundAfter time.Duration
 }
 
 type queued struct {
 	msg   matrixio.Message
+	seq   int64 // the message's transcript seq (0 for commands)
 	epoch int64
 	cmd   *commands.Command // non-nil for a command
 	upTo  int64             // newest seq when the command arrived (for /reset)
 }
 
 // Options configures New. Each room comes from RoomSpecs; the rooms listed
-// in Rooms (if any) all share Roster, Decider, Bots, Notifier and Memory.
+// in Rooms (if any) all share Roster, Decider, Bots, Notifier, Memory and
+// BackgroundAfter.
 type Options struct {
 	Store         *transcript.Store
 	RoomSpecs     []RoomSpec
 	MaxDeltaLines int
 	Log           *slog.Logger
 
-	Rooms    []string
-	Roster   *roster.Roster
-	Decider  turns.Decider
-	Bots     []*Bot
-	Notifier string
-	Memory   Memory
+	// RunTimeout is the most a run may take (hermes_timeout); it is then
+	// stopped. PollInterval is how often a run's status is read. The typing
+	// indicator is sent with TypingTimeout and refreshed every TypingEvery.
+	RunTimeout    time.Duration
+	PollInterval  time.Duration
+	TypingTimeout time.Duration
+	TypingEvery   time.Duration
+
+	Rooms           []string
+	Roster          *roster.Roster
+	Decider         turns.Decider
+	Bots            []*Bot
+	Notifier        string
+	Memory          Memory
+	BackgroundAfter time.Duration
 }
 
 // New builds an orchestrator; call Run to start the room workers.
@@ -133,15 +186,19 @@ func New(o Options) *Orchestrator {
 	or := &Orchestrator{
 		store: o.Store, maxDelta: o.MaxDeltaLines,
 		log: o.Log, now: time.Now, rooms: map[string]*worker{},
+		runTimeout: or0(o.RunTimeout, DefaultRunTimeout), pollInterval: or0(o.PollInterval, DefaultPollInterval),
+		typingTimeout: or0(o.TypingTimeout, DefaultTypingTimeout), typingEvery: or0(o.TypingEvery, DefaultTypingEvery),
 	}
 	specs := append([]RoomSpec{}, o.RoomSpecs...)
 	for _, r := range o.Rooms {
-		specs = append(specs, RoomSpec{ID: r, Roster: o.Roster, Decider: o.Decider, Bots: o.Bots, Notifier: o.Notifier, Memory: o.Memory})
+		specs = append(specs, RoomSpec{ID: r, Roster: o.Roster, Decider: o.Decider, Bots: o.Bots, Notifier: o.Notifier,
+			Memory: o.Memory, BackgroundAfter: o.BackgroundAfter})
 	}
 	for _, sp := range specs {
 		w := &worker{
 			id: sp.ID, roster: sp.Roster, builder: contextbuild.New(sp.Roster), decider: sp.Decider,
 			memory: sp.Memory, bots: map[string]*Bot{}, notifier: sp.Notifier, inbox: make(chan queued, 64),
+			backgroundAfter: sp.BackgroundAfter, busy: map[string]*job{},
 		}
 		for _, b := range sp.Bots {
 			w.bots[b.Key] = b
@@ -155,7 +212,16 @@ func New(o Options) *Orchestrator {
 	return or
 }
 
-// Run starts one worker per room and blocks until ctx is done and they exit.
+func or0(d, def time.Duration) time.Duration {
+	if d > 0 {
+		return d
+	}
+	return def
+}
+
+// Run starts one worker per room and blocks until ctx is done and they, and
+// every run they are following, exit. A run still going at shutdown is
+// logged and left to Hermes; its result is not posted.
 func (o *Orchestrator) Run(ctx context.Context) {
 	for _, w := range o.rooms {
 		o.wg.Add(1)
@@ -164,6 +230,7 @@ func (o *Orchestrator) Run(ctx context.Context) {
 			o.work(ctx, w)
 		}()
 	}
+	<-ctx.Done()
 	o.wg.Wait()
 }
 
@@ -185,7 +252,8 @@ func (o *Orchestrator) Handle(ctx context.Context, m matrixio.Message) {
 			return
 		}
 	}
-	if _, err := o.store.Append(ctx, entryOf(m)); err != nil {
+	seq, err := o.store.Append(ctx, entryOf(m))
+	if err != nil {
 		o.log.Error("recording message", "room", m.RoomID, "event", m.EventID, "err", err)
 		return
 	}
@@ -195,7 +263,7 @@ func (o *Orchestrator) Handle(ctx context.Context, m matrixio.Message) {
 	}
 	epoch := w.userEpoch.Add(1)
 	select {
-	case w.inbox <- queued{msg: m, epoch: epoch}:
+	case w.inbox <- queued{msg: m, seq: seq, epoch: epoch}:
 	default:
 		// Inbox full: the message is recorded and will reach bots as context;
 		// the newest queued user message still triggers.
@@ -205,7 +273,8 @@ func (o *Orchestrator) Handle(ctx context.Context, m matrixio.Message) {
 
 // enqueueCommand queues a user command without recording it. Like any user
 // message it stops a running chain; a /reset also discards a reply that is
-// still being generated, since it belongs to the old sessions.
+// still being generated in the foreground, since it belongs to the old
+// sessions.
 func (o *Orchestrator) enqueueCommand(ctx context.Context, w *worker, m matrixio.Message, cmd commands.Command) {
 	cmd.FormattedBody = m.FormattedBody
 	upTo, err := o.store.LatestSeq(ctx, m.RoomID)
@@ -233,6 +302,12 @@ func (o *Orchestrator) work(ctx context.Context, w *worker) {
 		case q := <-w.inbox:
 			if q.cmd != nil {
 				o.command(ctx, w, q)
+				continue
+			}
+			// Before coalescing: a message to a busy bot is steered even when
+			// a newer one is already queued.
+			if o.steer(ctx, w, q) {
+				w.state.UserSpoke()
 				continue
 			}
 			if q.epoch != w.userEpoch.Load() {
@@ -277,9 +352,14 @@ func (o *Orchestrator) command(ctx context.Context, w *worker, q queued) {
 			o.notice(ctx, w, "!explain: "+err.Error()+". Name a character, e.g. !explain "+w.roster.Bots()[0].Display+".")
 			return
 		}
+		if w.jobFor(bot) != nil {
+			log.Info("explain: the bot is busy", "bot", bot)
+			o.notice(ctx, w, display(w, bot)+" is busy with a task; try !explain again when it has answered.")
+			return
+		}
 		log.Info("explain", "bot", bot)
 		// One called turn: no router, no chain after it.
-		if _, spoke := o.speak(ctx, w, bot, commands.ExplainInstruction(w.roster.User().Display)); spoke {
+		if _, out := o.speak(ctx, w, bot, commands.ExplainInstruction(w.roster.User().Display), q.msg.EventID); out == spoke {
 			w.state.BotSpoke(bot)
 		}
 	}
@@ -297,6 +377,31 @@ func (o *Orchestrator) notice(ctx context.Context, w *worker, text string) {
 	}
 }
 
+func display(w *worker, botKey string) string {
+	if p, ok := w.roster.ByKey(botKey); ok && p != nil {
+		return p.Display
+	}
+	return botKey
+}
+
+func (w *worker) jobFor(bot string) *job {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.busy[bot]
+}
+
+func (w *worker) busyBots() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var out []string
+	for _, k := range w.botKeys {
+		if w.busy[k] != nil {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 func (o *Orchestrator) chain(ctx context.Context, w *worker, q queued) {
 	trig := turns.Trigger{
 		RoomID:    w.id,
@@ -309,13 +414,15 @@ func (o *Orchestrator) chain(ctx context.Context, w *worker, q queued) {
 			o.log.Info("user spoke mid-chain; stopping", "room", w.id)
 			return
 		}
-		next, ok, err := w.decider.Next(ctx, w.state, trig)
+		st := w.state
+		st.Busy = w.busyBots()
+		next, ok, err := w.decider.Next(ctx, st, trig)
 		if err != nil {
 			o.log.Error("turn decision failed", "room", w.id, "err", err)
 			return
 		}
 		if !ok {
-			o.log.Debug("turn decision: nobody speaks", "room", w.id, "bot_turns", w.state.BotTurns)
+			o.log.Debug("turn decision: nobody speaks", "room", w.id, "bot_turns", w.state.BotTurns, "busy", st.Busy)
 			return
 		}
 		if w.userEpoch.Load() != q.epoch {
@@ -325,9 +432,11 @@ func (o *Orchestrator) chain(ctx context.Context, w *worker, q queued) {
 			return
 		}
 		o.log.Debug("turn decision", "room", w.id, "next", next, "addressee", trig.Addressee, "bot_turns", w.state.BotTurns)
-		text, spoke := o.speak(ctx, w, next, "")
-		if !spoke {
-			return // silence or failure ends the chain; it is not a turn
+		text, out := o.speak(ctx, w, next, "", q.msg.EventID)
+		if out != spoke {
+			// Silence or failure ends the chain; it is not a turn. A run handed
+			// to the background ends it too: its result starts no chain.
+			return
 		}
 		w.state.BotSpoke(next)
 		trig = turns.Trigger{
@@ -339,48 +448,148 @@ func (o *Orchestrator) chain(ctx context.Context, w *worker, q queued) {
 	}
 }
 
-// speak makes one bot take one turn. It reports the posted text and whether
-// anything was posted. A non-empty instruction (used by /explain) is added
-// to the framed delta, and the bot is called even when it has nothing new.
-func (o *Orchestrator) speak(ctx context.Context, w *worker, botKey, instruction string) (string, bool) {
+// steer handles a user message that names a busy bot: it is steered into
+// that bot's run (acknowledged with a ✓ reaction from the bot) and starts
+// no chain. If Hermes refuses the steer, or the run ends without consuming
+// it, the message simply reaches the bot in its next delta. It reports
+// whether the message was addressed to a busy bot.
+func (o *Orchestrator) steer(ctx context.Context, w *worker, q queued) bool {
+	addr := w.roster.Addressee(q.msg.Body, q.msg.FormattedBody, q.msg.Mentions, "")
+	if addr == "" {
+		return false
+	}
+	j := w.jobFor(addr)
+	if j == nil {
+		return false
+	}
+	log := o.log.With("room", w.id, "bot", addr, "run", j.runID, "event", q.msg.EventID)
+	e := entryOf(q.msg)
+	e.Seq = q.seq
+	text := w.builder.Build(addr, []transcript.Entry{e})
+	if text == "" {
+		return true
+	}
+	req := steerReq{seq: q.seq, text: text, reply: make(chan error, 1)}
+	var err error
+	select {
+	case j.steers <- req:
+		err = <-req.reply
+	case <-j.polling:
+		err = fmt.Errorf("%w: the run already ended", hermes.ErrSteerRefused)
+	case <-ctx.Done():
+		return true
+	}
+	if err != nil {
+		log.Info("steer not delivered; the message waits for the bot's next turn", "err", err)
+		return true
+	}
+	log.Info("steered a message into the bot's background run")
+	if err := w.bots[addr].Poster.React(ctx, w.id, q.msg.EventID, SteerAck); err != nil {
+		log.Warn("reacting to a steered message", "err", err)
+	}
+	return true
+}
+
+// outcome is what one call to speak led to.
+type outcome int
+
+const (
+	silent       outcome = iota // nothing posted (silence, failure, nothing new)
+	spoke                       // a reply was posted
+	backgrounded                // the run continues in the background
+)
+
+// job is one bot's run. Its goroutine (follow) alone polls the run, keeps
+// the typing indicator up and sends steers, so a steer can never race the
+// run's end.
+type job struct {
+	bot     string
+	runID   string
+	sid     string
+	upTo    int64    // the delta's last seq: the cursor once the run succeeds
+	delta   string   // for CleanReply
+	memIDs  []string // memories in the input, delivered on success
+	replyTo string   // the message that started the chain (background replies)
+	resets  int64    // w.resets when the run started
+	start   time.Time
+
+	steers    chan steerReq
+	polling   chan struct{} // closed once the run has ended: no more steers
+	done      chan struct{} // closed when the result is ready for the worker
+	announced chan struct{} // closed once the hand-off notice is posted
+
+	// Set by follow before done is closed (or before it finishes the job itself).
+	run     hermes.Run
+	err     error
+	steered []steerReq // accepted by Hermes
+
+	backgrounded bool // guarded by worker.mu
+}
+
+type steerReq struct {
+	seq   int64
+	text  string
+	reply chan error
+}
+
+// speak makes one bot take one turn. It reports the posted text and the
+// outcome. A non-empty instruction (used by /explain) is added to the
+// framed delta, and the bot is called even when it has nothing new.
+// replyTo is the message a background result replies to.
+func (o *Orchestrator) speak(ctx context.Context, w *worker, botKey, instruction, replyTo string) (string, outcome) {
 	roomID := w.id
 	resets := w.resets.Load()
 	bot, ok := w.bots[botKey]
 	person, _ := w.roster.ByKey(botKey)
 	if !ok || person == nil {
 		o.log.Error("decider chose unknown bot", "bot", botKey)
-		return "", false
+		return "", silent
 	}
 	log := o.log.With("room", roomID, "bot", botKey)
+	if w.jobFor(botKey) != nil {
+		log.Info("bot is busy with a background task; not calling it")
+		return "", silent
+	}
 
 	cursor, err := o.store.Cursor(ctx, roomID, botKey)
 	if err != nil {
 		log.Error("reading cursor", "err", err)
-		return "", false
+		return "", silent
 	}
 	entries, err := o.store.Since(ctx, roomID, cursor, o.maxDelta)
 	if err != nil {
 		log.Error("reading transcript", "err", err)
-		return "", false
+		return "", silent
 	}
 	if len(entries) == 0 && instruction == "" {
 		log.Debug("nothing new for this bot", "cursor", cursor)
-		return "", false
+		return "", silent
 	}
 	upTo := cursor
 	if len(entries) > 0 {
 		upTo = entries[len(entries)-1].Seq
 	}
-	delta := w.builder.Build(botKey, entries)
+	steered, err := o.store.Steered(ctx, roomID, botKey, cursor)
+	if err != nil {
+		log.Error("reading steered messages", "err", err)
+		return "", silent
+	}
+	var fresh []transcript.Entry // what the bot hasn't seen: not already steered into a run
+	for _, e := range entries {
+		if !steered[e.Seq] {
+			fresh = append(fresh, e)
+		}
+	}
+	delta := w.builder.Build(botKey, fresh)
 	if delta == "" && instruction == "" {
-		log.Debug("delta empty after filtering (own lines / silence)")
+		log.Debug("delta empty after filtering (own lines / silence / steered)")
 		_ = o.store.SetCursor(ctx, roomID, botKey, upTo)
-		return "", false
+		return "", silent
 	}
 	gen, err := o.store.Generation(ctx, roomID, botKey)
 	if err != nil {
 		log.Error("reading session generation", "err", err)
-		return "", false
+		return "", silent
 	}
 	sid := SessionID(roomID, botKey, gen)
 
@@ -392,54 +601,296 @@ func (o *Orchestrator) speak(ctx context.Context, w *worker, botKey, instruction
 		memory, memIDs = w.memory.Block(ctx, roomID, sid)
 	}
 	start := o.now()
-	reply, err := bot.Hermes.Complete(ctx, sid, bot.System, FrameMemory(delta, person.Display, instruction, memory))
+	runID, err := bot.Hermes.Start(ctx, sid, bot.System, FrameMemory(delta, person.Display, instruction, memory))
 	if err != nil {
-		// Cursor stays put: the same delta is offered next time. (Whether
-		// Hermes stored the user turn of a failed run is unverified.)
-		lvl := slog.LevelWarn
-		if !errors.Is(err, hermes.ErrNoReply) {
-			lvl = slog.LevelError
+		// Cursor stays put: the same delta is offered next time.
+		log.Error("starting hermes run", "session", sid, "err", err)
+		return "", silent
+	}
+	j := &job{
+		bot: botKey, runID: runID, sid: sid, upTo: upTo, delta: delta, memIDs: memIDs,
+		replyTo: replyTo, resets: resets, start: start,
+		steers: make(chan steerReq), polling: make(chan struct{}), done: make(chan struct{}), announced: make(chan struct{}),
+	}
+	o.wg.Add(1)
+	go o.follow(ctx, w, j)
+
+	var handoff <-chan time.Time
+	if w.backgroundAfter > 0 {
+		t := time.NewTimer(w.backgroundAfter)
+		defer t.Stop()
+		handoff = t.C
+	}
+	select {
+	case <-j.done:
+		return o.finish(ctx, w, j, false)
+	case <-ctx.Done():
+		return "", silent // follow logs the run left in flight
+	case <-handoff:
+	}
+	w.mu.Lock()
+	select {
+	case <-j.done: // finished just as the timer fired
+		w.mu.Unlock()
+		return o.finish(ctx, w, j, false)
+	default:
+	}
+	j.backgrounded = true
+	w.busy[botKey] = j
+	w.mu.Unlock()
+	log.Info("run handed off to the background", "session", sid, "run", runID, "after", w.backgroundAfter)
+	o.notice(ctx, w, person.Display+" is working on it…")
+	close(j.announced)
+	return "", backgrounded
+}
+
+// follow polls one run until it ends, keeping the bot shown as typing and
+// passing steers to Hermes. On hermes_timeout it stops the run. A foreground
+// run's result goes back to the worker; a background run is finished here.
+func (o *Orchestrator) follow(ctx context.Context, w *worker, j *job) {
+	defer o.wg.Done()
+	bot := w.bots[j.bot]
+	log := o.log.With("room", w.id, "bot", j.bot, "run", j.runID)
+	// Calls that must still go out when ctx is cancelled (typing off, /stop).
+	bg := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	}
+	typing := func(c context.Context, on bool) {
+		if err := bot.Poster.Typing(c, w.id, on, o.typingTimeout); err != nil {
+			log.Debug("typing indicator", "on", on, "err", err)
 		}
-		log.Log(ctx, lvl, "hermes call produced no reply", "session", sid, "err", err)
-		return "", false
+	}
+	typing(ctx, true)
+	typingTick := time.NewTicker(o.typingEvery)
+	defer typingTick.Stop()
+	poll := time.NewTicker(o.pollInterval)
+	defer poll.Stop()
+	deadline := time.NewTimer(o.runTimeout - o.now().Sub(j.start))
+	defer deadline.Stop()
+
+	var run hermes.Run
+	var runErr error
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			close(j.polling)
+			c, cancel := bg()
+			typing(c, false)
+			cancel()
+			log.Warn("roomd is stopping while a run is in flight; it continues in Hermes, but its result will not be posted",
+				"session", j.sid, "running_for", o.now().Sub(j.start).Round(time.Second))
+			return
+		case <-typingTick.C:
+			typing(ctx, true)
+		case req := <-j.steers:
+			err := bot.Hermes.Steer(ctx, j.runID, req.text)
+			if err == nil {
+				j.steered = append(j.steered, req)
+			}
+			req.reply <- err
+		case <-deadline.C:
+			c, cancel := bg()
+			if err := bot.Hermes.Stop(c, j.runID); err != nil {
+				log.Warn("stopping a timed-out run", "err", err)
+			}
+			cancel()
+			run, runErr = hermes.Run{ID: j.runID, Status: statusTimeout}, fmt.Errorf("%w: run took longer than %v; stopped", hermes.ErrNoReply, o.runTimeout)
+			break loop
+		case <-poll.C:
+			r, err := bot.Hermes.Status(ctx, j.runID)
+			if err != nil {
+				if errors.Is(err, hermes.ErrRunNotFound) { // Hermes no longer knows the run
+					run, runErr = hermes.Run{ID: j.runID, Status: hermes.StatusFailed}, err
+					break loop
+				}
+				log.Debug("polling run status (will retry)", "err", err)
+				continue
+			}
+			if r.Terminal() {
+				run = r
+				break loop
+			}
+		}
+	}
+	close(j.polling)
+	c, cancel := bg()
+	typing(c, false)
+	if run.Status == hermes.StatusUnknown {
+		// The run's owner restarted mid-turn. Acknowledge it, or Hermes holds
+		// this session's later turns behind it.
+		if err := bot.Hermes.ResolveUnknown(c, run); err != nil {
+			log.Warn("resolving a run with an unknown outcome", "err", err)
+		}
+	}
+	cancel()
+	j.run, j.err = run, runErr
+
+	w.mu.Lock()
+	background := j.backgrounded
+	if !background {
+		close(j.done)
+	}
+	w.mu.Unlock()
+	if background {
+		o.finish(ctx, w, j, true)
+	}
+}
+
+// statusTimeout marks a run roomd stopped at hermes_timeout.
+const statusTimeout = "timeout"
+
+// finish turns an ended run into the bot's turn: the cursor, memory, steer
+// bookkeeping, cleanup and posting. A foreground result is posted as a
+// plain message; a background one as a reply to the message that asked for
+// it, after which the bot is free again.
+func (o *Orchestrator) finish(ctx context.Context, w *worker, j *job, background bool) (string, outcome) {
+	roomID, botKey := w.id, j.bot
+	person, _ := w.roster.ByKey(botKey)
+	log := o.log.With("room", roomID, "bot", botKey, "session", j.sid)
+	if background {
+		defer func() {
+			w.mu.Lock()
+			delete(w.busy, botKey)
+			w.mu.Unlock()
+		}()
+		select { // the result never lands before the hand-off notice
+		case <-j.announced:
+		case <-ctx.Done():
+		}
+	}
+
+	reply, err := j.run.Reply()
+	if j.err != nil {
+		err = j.err
+	}
+	if err != nil {
+		// Cursor stays put: the same delta (and any steered message) is
+		// offered next time.
+		log.Error("hermes run produced no reply", "run", j.runID, "status", j.run.Status, "err", err)
+		if background {
+			o.notice(ctx, w, failureNotice(person.Display, j.run.Status))
+		}
+		return "", silent
 	}
 	// Hermes now holds the delta (and any memory block) as a user turn, so
-	// never resend it.
-	if err := o.store.SetCursor(ctx, roomID, botKey, upTo); err != nil {
-		log.Error("advancing cursor", "err", err)
+	// never resend it. After a /reset the cursor already sits at the reset
+	// point, and steers went to the old session, so neither is touched.
+	if w.resets.Load() == j.resets {
+		if err := o.store.SetCursor(ctx, roomID, botKey, j.upTo); err != nil {
+			log.Error("advancing cursor", "err", err)
+		}
+		for _, s := range j.steered {
+			if strings.Contains(j.run.PendingSteer, s.text) {
+				log.Info("a steered message was never consumed; it stays in the next delta", "seq", s.seq)
+				continue
+			}
+			if err := o.store.MarkSteered(ctx, roomID, botKey, s.seq); err != nil {
+				log.Error("recording a consumed steer", "seq", s.seq, "err", err)
+			}
+		}
 	}
 	if w.memory != nil {
-		w.memory.Delivered(sid, memIDs)
+		w.memory.Delivered(j.sid, j.memIDs)
 	}
 	if reply.Silent {
-		log.Info("bot stayed silent", "session", sid)
-		return "", false
+		log.Info("bot stayed silent")
+		return "", silent
 	}
 	log.Debug("raw reply", "text", reply.Text)
-	reply.Text = CleanReply(reply.Text, person.Display, w.roster, delta)
+	reply.Text = CleanReply(reply.Text, person.Display, w.roster, j.delta)
 	if reply.Text == "" {
-		log.Warn("reply only echoed the context or spoke for others; posting nothing", "session", sid)
-		return "", false
+		log.Warn("reply only echoed the context or spoke for others; posting nothing")
+		return "", silent
 	}
-	if w.resets.Load() != resets {
-		log.Info("discarding a reply from before /reset", "session", sid)
-		return "", false
+	if reply.Partial {
+		log.Warn("posting a partial reply (the turn ended unfinished)", "reason", j.run.TurnExitReason)
 	}
-	if reply.FinishReason == "length" {
-		log.Warn("posting partial reply (finish_reason=length)", "session", sid)
+	replyTo := ""
+	if background {
+		// Real work the user asked for: posted even after a /reset.
+		replyTo = j.replyTo
+	} else if w.resets.Load() != j.resets {
+		log.Info("discarding a reply from before /reset")
+		return "", silent
 	}
-	eventID, err := bot.Poster.Send(ctx, roomID, reply.Text)
-	if err != nil {
-		log.Error("posting reply", "err", err)
-		return "", false
+	posted, ok := o.post(ctx, w, botKey, reply.Text, replyTo, log)
+	if !ok {
+		return "", silent
 	}
-	if _, err := o.store.Append(ctx, transcript.Entry{
-		RoomID: roomID, EventID: eventID, Sender: person.MXID, Body: reply.Text, TS: o.now().UnixMilli(),
-	}); err != nil {
-		log.Error("recording own reply", "err", err)
+	reply.Text = posted
+	log.Info("bot spoke", "took", o.now().Sub(j.start).Round(time.Millisecond), "chars", len(reply.Text), "background", background)
+	return reply.Text, spoke
+}
+
+// post sends a cleaned reply as the bot: its text and inline images in
+// their original order, each image as an m.image and text longer than one
+// event allows split into several messages. Only the first event carries
+// the reply relation. Each event is recorded in the transcript, images as
+// "[image]", never their data. An image that fails to upload is replaced by
+// a short note, so the reply is never lost. It returns the reply as the
+// transcript recorded it, and whether anything was posted.
+func (o *Orchestrator) post(ctx context.Context, w *worker, botKey, text, replyTo string, log *slog.Logger) (string, bool) {
+	bot := w.bots[botKey]
+	person, _ := w.roster.ByKey(botKey)
+	parts, dropped := media.Split(text)
+	for _, d := range dropped {
+		log.Warn("left out of the posted reply", "what", d)
 	}
-	log.Info("bot spoke", "session", sid, "took", o.now().Sub(start).Round(time.Millisecond), "chars", len(reply.Text))
-	return reply.Text, true
+	var recorded []string
+	record := func(eventID, body string) {
+		replyTo = "" // the relation goes on the first event only
+		recorded = append(recorded, body)
+		if _, err := o.store.Append(ctx, transcript.Entry{
+			RoomID: w.id, EventID: eventID, Sender: person.MXID, Body: body, TS: o.now().UnixMilli(),
+		}); err != nil {
+			log.Error("recording own reply", "err", err)
+		}
+	}
+	sendText := func(t string) {
+		var id string
+		var err error
+		if replyTo != "" {
+			id, err = bot.Poster.SendReply(ctx, w.id, t, replyTo)
+		} else {
+			id, err = bot.Poster.Send(ctx, w.id, t)
+		}
+		if err != nil {
+			log.Error("posting reply", "err", err, "chars", len(t))
+			return
+		}
+		record(id, t)
+	}
+	for _, p := range parts {
+		if p.Image == nil {
+			for _, chunk := range media.Chunks(p.Text, media.MaxText) {
+				sendText(chunk)
+			}
+			continue
+		}
+		id, err := bot.Poster.SendImage(ctx, w.id, *p.Image, replyTo)
+		if err != nil {
+			log.Error("posting an image; sending a note instead", "err", err, "mime", p.Image.MIME, "bytes", len(p.Image.Data))
+			sendText(media.Unsent)
+			continue
+		}
+		record(id, media.Placeholder)
+	}
+	return strings.Join(recorded, "\n"), len(recorded) > 0
+}
+
+// failureNotice is the listener's short notice for a background run that
+// ended without a reply.
+func failureNotice(name, status string) string {
+	switch status {
+	case statusTimeout:
+		return name + " ran out of time on that task and stopped."
+	case hermes.StatusCancelled:
+		return name + "'s task was cancelled."
+	case hermes.StatusInterrupted, hermes.StatusUnknown:
+		return name + "'s task was interrupted (Hermes restarted)."
+	}
+	return name + " couldn't finish that task."
 }
 
 // SessionID is the API-owned Hermes session id for one bot in one room:

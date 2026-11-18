@@ -13,6 +13,7 @@ rooms:                                   # room IDs from Room settings → Advan
   #   bots: [ada, cleo]                  # the cast: who takes part here (default: all bots)
   #   listener: cleo                      # whose roomd device syncs this room and posts its notices; must be in bots
   #   max_bot_turns: 3
+  #   background_after: 0s               # this room always waits for a bot's run
   #   rules_file: rules/lounge.md        # this room's group rules (default: group_rules_file)
   #   memory:                            # needs memory.enabled: true (below)
   #     bank_id: roomd-lounge            # this room's own bank: nothing from other rooms comes up here
@@ -24,7 +25,8 @@ max_delta_lines: 40     # most transcript lines sent to a bot in one call (caps 
 msgtype: m.text         # or m.notice (clients render notices as bot output, no notifications)
 state_db: ./roomd.db    # SQLite: transcript, cursors, session generations (relative to this file)
 group_rules_file: ./rules/rules.md   # system prompt; {{name}} {{user}} {{others}} are filled per bot
-hermes_timeout: 5m      # per call; agent runs with tools can take minutes
+hermes_timeout: 5m      # most a bot's run may take (agent runs with tools can take minutes); then it is stopped
+background_after: 20s   # a run still going after this continues in the background and the room moves on; 0 = always wait
 listener: cleo          # default listener: whose roomd device runs /sync (default: first bot key alphabetically);
                         # a room whose cast lacks it uses its first cast bot, or its own listener:
 

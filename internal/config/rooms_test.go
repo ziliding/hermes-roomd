@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 const threeBots = `
@@ -155,5 +156,45 @@ rooms:
 	write("roomd.yaml", threeBots+`rooms: [{ id: "!b:z", rules_file: empty.md }]`+"\n")
 	if _, err := Load(filepath.Join(dir, "roomd.yaml")); err == nil || !strings.Contains(err.Error(), "is empty") {
 		t.Fatalf("empty rules file: err %v", err)
+	}
+}
+
+func TestBackgroundAfter(t *testing.T) {
+	rooms := `
+rooms:
+  - "!plain:example.com"
+  - { id: "!off:example.com", background_after: 0s }
+  - { id: "!slow:example.com", background_after: 45s }
+`
+	tests := []struct {
+		name    string
+		top     string
+		want    []time.Duration // per room
+		wantErr string
+	}{
+		{"default 20s, rooms override", "", []time.Duration{20 * time.Second, 0, 45 * time.Second}, ""},
+		{"top level 0 turns it off", "background_after: 0\n", []time.Duration{0, 0, 45 * time.Second}, ""},
+		{"top level value", "background_after: 10s\n", []time.Duration{10 * time.Second, 0, 45 * time.Second}, ""},
+		{"negative", "background_after: -1s\n", nil, "background_after must be 0 (off)"},
+		{"not below hermes_timeout", "hermes_timeout: 30s\n", nil, "room !slow:example.com: background_after (45s) must be shorter than hermes_timeout"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := Parse([]byte(threeBots+tt.top+rooms), env(threeEnv))
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, r := range c.Rooms {
+				if time.Duration(*r.BackgroundAfter) != tt.want[i] {
+					t.Errorf("room %s: %v, want %v", r.ID, *r.BackgroundAfter, tt.want[i])
+				}
+			}
+		})
 	}
 }

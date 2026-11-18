@@ -154,3 +154,31 @@ func contains(xs []string, x string) bool {
 	}
 	return false
 }
+
+func TestBusyBotsAreNeverPicked(t *testing.T) {
+	tests := []struct {
+		name string
+		st   State
+		trig Trigger
+		ok   bool
+	}{
+		{"named busy bot is not picked", State{Busy: []string{"cleo"}}, Trigger{FromUser: true, Addressee: "cleo"}, true},
+		{"bot names a busy bot", State{BotTurns: 1, LastBot: "ada", Busy: []string{"dex"}}, Trigger{Sender: "ada", Addressee: "dex"}, true},
+		{"random pool skips busy", State{Busy: []string{"ada", "bram"}}, Trigger{FromUser: true}, true},
+		{"everyone else busy: nobody", State{BotTurns: 1, LastBot: "ada", Busy: []string{"bram", "cleo", "dex"}}, Trigger{Sender: "ada"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for i := 0; i < 50; i++ {
+				r := NewRules(bots, 3, rand.New(rand.NewPCG(uint64(i), 7)))
+				got, ok, _ := r.Next(context.Background(), tt.st, tt.trig)
+				if ok != tt.ok {
+					t.Fatalf("ok = %v, want %v (got %q)", ok, tt.ok, got)
+				}
+				if ok && (tt.st.IsBusy(got) || got == tt.st.LastBot) {
+					t.Fatalf("picked %q with busy %v", got, tt.st.Busy)
+				}
+			}
+		})
+	}
+}

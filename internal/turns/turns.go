@@ -14,6 +14,19 @@ import (
 type State struct {
 	BotTurns int    // consecutive bot replies since the user last spoke
 	LastBot  string // bot key that spoke last ("" after a user message)
+	// Busy lists bots working on a background task in this room. They are
+	// never picked. The orchestrator fills it before every decision.
+	Busy []string
+}
+
+// IsBusy reports whether bot is in Busy.
+func (s State) IsBusy(bot string) bool {
+	for _, b := range s.Busy {
+		if b == bot {
+			return true
+		}
+	}
+	return false
 }
 
 // UserSpoke resets the counters: the user always regains the floor.
@@ -60,12 +73,12 @@ func (r *Rules) Next(_ context.Context, st State, t Trigger) (string, bool, erro
 	if st.BotTurns >= r.MaxBotTurns {
 		return "", false, nil
 	}
-	if t.Addressee != "" && t.Addressee != st.LastBot && r.known(t.Addressee) {
+	if t.Addressee != "" && t.Addressee != st.LastBot && r.known(t.Addressee) && !st.IsBusy(t.Addressee) {
 		return t.Addressee, true, nil
 	}
 	var pool []string
 	for _, b := range r.Bots {
-		if b != st.LastBot {
+		if b != st.LastBot && !st.IsBusy(b) {
 			pool = append(pool, b)
 		}
 	}

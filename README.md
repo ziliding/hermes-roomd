@@ -2,15 +2,15 @@
 
 roomd runs multi-bot **Matrix group rooms** whose characters are **Hermes
 Agent** profiles. Deterministic code, not the models, decides who speaks and
-what each bot sees. A bot is called through the Hermes OpenAI-compatible API
-only when it is its turn, and roomd posts the reply as that bot.
+what each bot sees. A bot is called through the Hermes Runs API only when it
+is its turn, and roomd posts the reply as that bot.
 
 ```
 Alex (Element X) ──► Matrix group room ◄── roomd ── 1. decide who speaks (or nobody)
                                               │     2. build the bot's attributed delta (+ recalled memory)
                                               ▼
-                     Hermes: POST /p/<profile>/v1/chat/completions
-                             X-Hermes-Session-Id: grp-<roomhash>-<bot>-g<N>
+                     Hermes: POST /p/<profile>/v1/runs
+                             session_id: grp-<roomhash>-<bot>-g<N>
                                               │
                      roomd posts the reply as that bot (roomd's own device for it)
 ```
@@ -39,6 +39,55 @@ recorded but never trigger anything on their own.
 - **Silence.** A reply that is only a silence marker (`[SILENT]`, `NO_REPLY`,
   `(silent)`, `🔇`, `.`, `…`) posts nothing and ends the chain.
 
+### Images
+
+Hermes turns an image a bot made (`MEDIA:/path/to/file.png`) into an inline
+`![image](data:image/png;base64,…)` in the reply. roomd posts each one as a
+real Matrix image: it uploads it to the homeserver as that bot and sends an
+`m.image`.
+
+- **Order:** the reply's text and images go out in their original order,
+  one event each. A background result's reply relation goes on the first
+  event.
+- **Transcript:** each image is recorded as `[image]`, never its data, so
+  deltas and memory stay small.
+- **Failures:** an image that fails to upload, or isn't a decodable image,
+  becomes "(image could not be sent)" and the rest still posts. `MEDIA:`
+  tags Hermes left alone (not an image, or too big) are removed, so no
+  server path reaches the room.
+- **Long text** is split into several messages, below Matrix's 64 KB event
+  limit.
+
+### Long tasks
+
+While a bot's run is going, the bot shows as typing. A bot doing real tool
+work doesn't hold up the room:
+
+- **Hand-off.** A run still going after `background_after` (default 20s)
+  continues in the background. The listener posts one notice ("Ada is
+  working on it…"), the bot is **busy** in that room, and the room goes on.
+  Quicker replies work as before.
+- **Busy bots are skipped.** Neither the turn rules nor the router pick a
+  busy bot. Busy is per room, so the bot still answers in other rooms.
+- **The result** is posted by the bot as a Matrix reply to the message that
+  asked for it. It starts no chain.
+- **Failure.** If the run fails, is cancelled or exceeds `hermes_timeout`
+  (roomd then stops it), the listener posts a short notice. The request
+  stays in the bot's next delta.  A turn that ends unfinished (for example out of
+  iterations) still posts the text it has.
+- **Steering.** A message that names a busy bot is steered into its running
+  task (Hermes `/v1/runs/{id}/steer`), attributed like any delta line. The
+  bot acknowledges it with a ✓ reaction, and no chain starts. A steered
+  message counts as seen only if the run consumed it. One the run never
+  read, or that Hermes refused, reaches the bot in its next delta, never
+  twice. Messages to others aren't steered; the busy bot sees them on its
+  next turn.
+- **`!reset` while busy:** the result is still posted, and the bot's next
+  run uses the new session. **`!explain` on a busy bot:** a short notice
+  that it is busy.
+- **Restarting roomd** while a run is in the background leaves the run to
+  Hermes; its result isn't posted.
+
 ### The router (optional)
 
 With `router.enabled`, a separate cheap model (any OpenAI-compatible
@@ -56,12 +105,13 @@ is still open, or the character clearly has something new to add.
 
 ### What a bot sees
 
-Each bot has one Hermes session per room. Hermes keeps the history, so roomd
-sends only two messages per call:
+Each bot has one Hermes session per room. Hermes keeps the history, so each
+run carries only two things:
 
-- **System:** the room's group rules, filled in for that bot. They are
-  byte-identical on every call, so the prompt cache stays warm.
-- **User:** what that bot hasn't seen yet, one element per message:
+- **Instructions** (the system prompt): the room's group rules, filled in
+  for that bot. They are byte-identical on every call, so the prompt cache
+  stays warm.
+- **Input:** what that bot hasn't seen yet, one element per message:
   ```
   <msg from="Cleo">…</msg>
   ```
@@ -148,7 +198,9 @@ deploy/roomd.service        systemd user unit
   - `rooms`;
   - `max_bot_turns`, `max_delta_lines`;
   - `msgtype` (`m.text` or `m.notice`);
-  - `state_db`, `group_rules_file`, `hermes_timeout`;
+  - `state_db`, `group_rules_file`;
+  - `hermes_timeout` (the most a run may take), `background_after` (when a
+    run moves to the background; `0` means always wait);
   - `listener`: the bot whose roomd device runs `/sync` and posts notices.
 - **`bots.<key>`:**
   - `display`, `mxid`;
@@ -183,6 +235,7 @@ rooms:
     bots: [ada, cleo]              # the cast (default: all bots)
     listener: cleo                 # must be in the cast
     max_bot_turns: 3
+    background_after: 0s           # always wait for a bot's run here
     rules_file: rules/lounge.md
     memory: { bank_id: roomd-lounge, retain: { idle_minutes: 10 } }
 ```
@@ -220,10 +273,11 @@ Do this once, before the first message in a group room.
    settings apply to group turns. Smoke test with a throwaway session id,
    never a `grp-…` one:
    ```bash
-   curl -s http://127.0.0.1:8642/p/ada/v1/chat/completions \
+   curl -s http://127.0.0.1:8642/p/ada/v1/runs \
      -H "Authorization: Bearer $ROOMD_ADA_API_KEY" -H 'Content-Type: application/json' \
-     -H 'X-Hermes-Session-Id: roomd-smoke-ada-1' \
-     -d '{"messages":[{"role":"user","content":"say hi in one line"}]}'
+     -d '{"input":"say hi in one line","session_id":"roomd-smoke-ada-1","instructions":"Be brief."}'
+   # → {"run_id": "run_…", "status": "started"}; then:
+   curl -s http://127.0.0.1:8642/p/ada/v1/runs/<run_id> -H "Authorization: Bearer $ROOMD_ADA_API_KEY"
    ```
 2. **Keep the Hermes Matrix gateways out of group rooms,** or every message
    gets two replies.
@@ -318,17 +372,18 @@ Requires Go ≥ 1.26 and builds as pure Go (no cgo, no libolm).
 cmd/roomd             wiring, config load, sync loops, signals
 internal/config       YAML → validated config; secrets from env
 internal/matrixio     per-bot senders and the /sync listener
-internal/transcript   SQLite: messages, cursors, generations, retain cursors
+internal/transcript   SQLite: messages, cursors, generations, steered messages, retain cursors
 internal/roster       who is who; addressee and pill detection
 internal/contextbuild delta → <msg from="Name"> elements, mention rewriting
 internal/silence      silence-marker detection
 internal/turns        Decider interface and the plain turn rules
 internal/router       LLM router (a turns.Decider that falls back to the rules)
 internal/commands     !reset and !explain parsing
-internal/hermes       chat-completions client
+internal/media        inline images and MEDIA: tags out of replies; long-text splitting
+internal/hermes       Runs API client (start, poll, steer, stop); hermestest is a fake server
 internal/hindsight    Hindsight HTTP client (recall, retain, banks)
 internal/memory       recall block and once-per-conversation retain
-internal/room         the orchestrator: one worker per room, the turn chain
+internal/room         the orchestrator: one worker per room, the turn chain, background runs
 ```
 
 ## License

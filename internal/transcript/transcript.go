@@ -59,6 +59,12 @@ CREATE TABLE IF NOT EXISTS segment_breaks (
 	seq     INTEGER NOT NULL,
 	PRIMARY KEY (room_id, seq)
 );
+CREATE TABLE IF NOT EXISTS steered (
+	room_id TEXT NOT NULL,
+	bot     TEXT NOT NULL,
+	seq     INTEGER NOT NULL,
+	PRIMARY KEY (room_id, bot, seq)
+);
 CREATE TABLE IF NOT EXISTS generations (
 	room_id TEXT NOT NULL,
 	bot     TEXT NOT NULL,
@@ -137,12 +143,44 @@ func (s *Store) Cursor(ctx context.Context, roomID, bot string) (int64, error) {
 }
 
 // SetCursor records that everything up to seq has been delivered to the bot.
+// The cursor never moves back. Steered marks at or below it are dropped.
 func (s *Store) SetCursor(ctx context.Context, roomID, bot string, seq int64) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO cursors(room_id, bot, seen_seq) VALUES(?,?,?)
 		 ON CONFLICT(room_id, bot) DO UPDATE SET seen_seq = MAX(seen_seq, excluded.seen_seq)`,
 		roomID, bot, seq)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
+		`DELETE FROM steered WHERE room_id = ? AND bot = ?
+		 AND seq <= (SELECT seen_seq FROM cursors WHERE room_id = ? AND bot = ?)`, roomID, bot, roomID, bot)
 	return err
+}
+
+// MarkSteered records that the message at seq already reached the bot's
+// session as a steer, beyond its cursor, so it is left out of later deltas.
+func (s *Store) MarkSteered(ctx context.Context, roomID, bot string, seq int64) error {
+	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO steered(room_id, bot, seq) VALUES(?,?,?)`, roomID, bot, seq)
+	return err
+}
+
+// Steered returns the seqs above after that reached the bot as steers.
+func (s *Store) Steered(ctx context.Context, roomID, bot string, after int64) (map[int64]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT seq FROM steered WHERE room_id = ? AND bot = ? AND seq > ?`, roomID, bot, after)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]bool{}
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			return nil, err
+		}
+		out[seq] = true
+	}
+	return out, rows.Err()
 }
 
 // Generation returns the bot's Hermes session generation in room, starting at 1.

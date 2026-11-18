@@ -9,7 +9,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/ziliding/hermes-roomd/internal/media"
 	"maunium.net/go/mautrix"
 )
 
@@ -93,5 +95,102 @@ func TestSendNoticeIsTaggedAndEchoIsMarkedControl(t *testing.T) {
 	plain.Content.ParseRaw(plain.Type)
 	if m, ok := toMessage(plain); !ok || m.Control {
 		t.Fatalf("plain notice = %+v ok=%v", m, ok)
+	}
+}
+
+func TestReplyReactionTypingWireShapes(t *testing.T) {
+	type req struct {
+		method, path string
+		body         map[string]any
+	}
+	var got []req
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		_ = json.Unmarshal(raw, &body)
+		got = append(got, req{r.Method, r.URL.EscapedPath(), body})
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"event_id":"$e"}`)
+	}))
+	defer srv.Close()
+	cli, err := mautrix.NewClient(srv.URL, "@ada:z", "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Sender{cli: cli, msgType: event.MsgText}
+	ctx := context.Background()
+	if _, err := s.SendReply(ctx, "!r:z", "here it is", "$req"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.React(ctx, "!r:z", "$req", "✓"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Typing(ctx, "!r:z", true, 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("requests %+v", got)
+	}
+	rel, _ := got[0].body["m.relates_to"].(map[string]any)
+	irt, _ := rel["m.in_reply_to"].(map[string]any)
+	if !strings.Contains(got[0].path, "/send/m.room.message/") || irt["event_id"] != "$req" || got[0].body["body"] != "here it is" {
+		t.Errorf("reply %+v", got[0])
+	}
+	if m, ok := got[0].body["m.mentions"].(map[string]any); !ok || len(m) != 0 {
+		t.Errorf("reply must ping nobody: %v", got[0].body["m.mentions"])
+	}
+	ann, _ := got[1].body["m.relates_to"].(map[string]any)
+	if !strings.Contains(got[1].path, "/send/m.reaction/") || ann["rel_type"] != "m.annotation" || ann["event_id"] != "$req" || ann["key"] != "✓" {
+		t.Errorf("reaction %+v", got[1])
+	}
+	if got[2].method != http.MethodPut || !strings.Contains(got[2].path, "/typing/") || got[2].body["typing"] != true || got[2].body["timeout"] != float64(30000) {
+		t.Errorf("typing %+v", got[2])
+	}
+}
+
+func TestSendImageUploadsThenPostsMImage(t *testing.T) {
+	var uploadPath, uploadType, uploadQuery string
+	var uploaded []byte
+	var sent map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/media/") {
+			uploadPath, uploadType, uploadQuery, uploaded = r.URL.Path, r.Header.Get("Content-Type"), r.URL.RawQuery, raw
+			io.WriteString(w, `{"content_uri":"mxc://example.com/abc"}`)
+			return
+		}
+		_ = json.Unmarshal(raw, &sent)
+		io.WriteString(w, `{"event_id":"$img"}`)
+	}))
+	defer srv.Close()
+	cli, err := mautrix.NewClient(srv.URL, "@ada:z", "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Sender{cli: cli, msgType: event.MsgText}
+	img := media.Image{Alt: "a cat", MIME: "image/png", Data: []byte("PNGDATA"), Width: 3, Height: 2}
+	evID, err := s.SendImage(context.Background(), "!r:z", img, "$req")
+	if err != nil || evID != "$img" {
+		t.Fatalf("event %q err %v", evID, err)
+	}
+	if !strings.HasSuffix(uploadPath, "/_matrix/media/v3/upload") || uploadType != "image/png" || string(uploaded) != "PNGDATA" || !strings.Contains(uploadQuery, "filename=image.png") {
+		t.Errorf("upload %q %q %q %q", uploadPath, uploadType, uploadQuery, uploaded)
+	}
+	info, _ := sent["info"].(map[string]any)
+	rel, _ := sent["m.relates_to"].(map[string]any)
+	irt, _ := rel["m.in_reply_to"].(map[string]any)
+	if sent["msgtype"] != "m.image" || sent["url"] != "mxc://example.com/abc" || sent["body"] != "a cat" ||
+		info["mimetype"] != "image/png" || info["size"] != float64(7) || info["w"] != float64(3) || info["h"] != float64(2) || irt["event_id"] != "$req" {
+		t.Errorf("m.image content %v", sent)
+	}
+
+	// Without a reply target there is no relation.
+	sent = nil
+	if _, err := s.SendImage(context.Background(), "!r:z", img, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, has := sent["m.relates_to"]; has {
+		t.Errorf("unexpected relation %v", sent["m.relates_to"])
 	}
 }

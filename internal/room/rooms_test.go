@@ -35,12 +35,13 @@ func newRoomsHarness(t *testing.T) *harness {
 	}
 	t.Cleanup(func() { store.Close() })
 	h := &harness{t: t, reply: func(bot string, n int) string { return "reply " + bot }}
+	h.startServer()
 	spec := func(id, prefix string, cast []string, listener string, maxTurns int) RoomSpec {
 		var people []roster.Person
 		var bots []*Bot
 		for _, k := range cast {
 			people = append(people, allPeople[k])
-			bots = append(bots, &Bot{Key: k, Poster: fakePoster{h, k}, Hermes: fakeHermes{h, k}, System: prefix + "-SYS-" + k})
+			bots = append(bots, &Bot{Key: k, Poster: fakePoster{h, k}, Hermes: h.runner(k), System: prefix + "-SYS-" + k})
 		}
 		return RoomSpec{
 			ID: id, Roster: roster.New("@alex:z", "Alex", people), Bots: bots, Notifier: listener,
@@ -48,7 +49,7 @@ func newRoomsHarness(t *testing.T) *harness {
 		}
 	}
 	h.o = New(Options{
-		Store: store, MaxDeltaLines: 40, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Store: store, MaxDeltaLines: 40, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), PollInterval: 2 * time.Millisecond,
 		RoomSpecs: []RoomSpec{
 			spec(roomID, "LOUNGE", []string{"ada", "cleo"}, "cleo", 3),
 			spec(roomB, "LIBRARY", []string{"ada", "bram"}, "bram", 1),
@@ -58,8 +59,11 @@ func newRoomsHarness(t *testing.T) *harness {
 }
 
 func (h *harness) say(room, body string) matrixio.Message {
+	h.mu.Lock()
 	h.seq++
-	return matrixio.Message{RoomID: room, EventID: fmt.Sprintf("$m%d", h.seq), Sender: "@alex:z", Body: body, TS: time.Now().UnixMilli()}
+	n := h.seq
+	h.mu.Unlock()
+	return matrixio.Message{RoomID: room, EventID: fmt.Sprintf("$m%d", n), Sender: "@alex:z", Body: body, TS: time.Now().UnixMilli()}
 }
 
 func (h *harness) runIn(room, body string) {

@@ -123,13 +123,16 @@ func (m Memory) RetainOn() bool { return m.Enabled && (m.Retain.Enabled == nil |
 // (every setting from the top level) or a mapping with overrides. Every
 // override left empty takes the top-level value.
 type Room struct {
-	ID          string     `yaml:"id"`
-	Name        string     `yaml:"name"`     // a label for logs; optional
-	Bots        []string   `yaml:"bots"`     // the cast: bot keys taking part (default: all bots)
-	Listener    string     `yaml:"listener"` // whose roomd device runs /sync for this room and posts its notices
-	MaxBotTurns int        `yaml:"max_bot_turns"`
-	RulesFile   string     `yaml:"rules_file"` // this room's group rules (default: group_rules_file)
-	Memory      RoomMemory `yaml:"memory"`
+	ID          string   `yaml:"id"`
+	Name        string   `yaml:"name"`     // a label for logs; optional
+	Bots        []string `yaml:"bots"`     // the cast: bot keys taking part (default: all bots)
+	Listener    string   `yaml:"listener"` // whose roomd device runs /sync for this room and posts its notices
+	MaxBotTurns int      `yaml:"max_bot_turns"`
+	// BackgroundAfter overrides the top-level background_after for this room
+	// (nil: inherit; 0: never hand a run off to the background).
+	BackgroundAfter *Duration  `yaml:"background_after"`
+	RulesFile       string     `yaml:"rules_file"` // this room's group rules (default: group_rules_file)
+	Memory          RoomMemory `yaml:"memory"`
 
 	Rules string `yaml:"-"` // contents of the effective rules file
 }
@@ -233,31 +236,35 @@ func (c *Config) ListenerGroups() map[string][]string {
 
 // Config is the whole roomd configuration.
 type Config struct {
-	Homeserver     string          `yaml:"homeserver"`
-	User           string          `yaml:"user"`
-	UserDisplay    string          `yaml:"user_display"`
-	Rooms          []*Room         `yaml:"rooms"`
-	MaxBotTurns    int             `yaml:"max_bot_turns"`
-	MaxDeltaLines  int             `yaml:"max_delta_lines"`
-	MsgType        MsgType         `yaml:"msgtype"`
-	StateDB        string          `yaml:"state_db"`
-	GroupRulesFile string          `yaml:"group_rules_file"`
-	HermesTimeout  time.Duration   `yaml:"hermes_timeout"`
-	Listener       string          `yaml:"listener"` // bot key whose roomd device runs /sync
-	Bots           map[string]*Bot `yaml:"bots"`
-	Router         Router          `yaml:"router"`
-	Memory         Memory          `yaml:"memory"`
+	Homeserver     string        `yaml:"homeserver"`
+	User           string        `yaml:"user"`
+	UserDisplay    string        `yaml:"user_display"`
+	Rooms          []*Room       `yaml:"rooms"`
+	MaxBotTurns    int           `yaml:"max_bot_turns"`
+	MaxDeltaLines  int           `yaml:"max_delta_lines"`
+	MsgType        MsgType       `yaml:"msgtype"`
+	StateDB        string        `yaml:"state_db"`
+	GroupRulesFile string        `yaml:"group_rules_file"`
+	HermesTimeout  time.Duration `yaml:"hermes_timeout"`
+	// BackgroundAfter: a run still going after this long continues in the
+	// background and the room moves on (nil: the default; 0: never).
+	BackgroundAfter *Duration       `yaml:"background_after"`
+	Listener        string          `yaml:"listener"` // bot key whose roomd device runs /sync
+	Bots            map[string]*Bot `yaml:"bots"`
+	Router          Router          `yaml:"router"`
+	Memory          Memory          `yaml:"memory"`
 
 	GroupRules string `yaml:"-"` // contents of GroupRulesFile
 }
 
 // Defaults applied when a field is left zero.
 const (
-	DefaultMaxBotTurns   = 2
-	DefaultMaxDeltaLines = 40
-	DefaultHermesTimeout = 5 * time.Minute
-	DefaultRouterTimeout = 15 * time.Second
-	DefaultRouterWindow  = 12
+	DefaultMaxBotTurns     = 2
+	DefaultMaxDeltaLines   = 40
+	DefaultHermesTimeout   = 5 * time.Minute
+	DefaultBackgroundAfter = 20 * time.Second
+	DefaultRouterTimeout   = 15 * time.Second
+	DefaultRouterWindow    = 12
 
 	DefaultMemoryBank        = "roomd-group"
 	DefaultRecallMaxTokens   = 400
@@ -356,6 +363,10 @@ func (c *Config) applyDefaults() {
 	if c.HermesTimeout == 0 {
 		c.HermesTimeout = DefaultHermesTimeout
 	}
+	if c.BackgroundAfter == nil {
+		d := Duration(DefaultBackgroundAfter)
+		c.BackgroundAfter = &d
+	}
 	if c.UserDisplay == "" {
 		c.UserDisplay = "Alex"
 	}
@@ -373,6 +384,9 @@ func (c *Config) applyDefaults() {
 		}
 		if r.MaxBotTurns == 0 {
 			r.MaxBotTurns = c.MaxBotTurns
+		}
+		if r.BackgroundAfter == nil {
+			r.BackgroundAfter = c.BackgroundAfter
 		}
 		if r.Listener == "" {
 			r.Listener = keyList(r.Bots).first()
@@ -482,6 +496,9 @@ func (c *Config) validate(lookupEnv func(string) (string, bool)) error {
 	if c.MsgType != MsgText && c.MsgType != MsgNotice {
 		fail("msgtype must be %q or %q", MsgText, MsgNotice)
 	}
+	if c.BackgroundAfter != nil {
+		checkBackgroundAfter("background_after", time.Duration(*c.BackgroundAfter), c.HermesTimeout, fail)
+	}
 	if c.HermesTimeout < 0 {
 		fail("hermes_timeout must be positive")
 	}
@@ -568,12 +585,44 @@ func (c *Config) validateRooms(fail func(string, ...any)) {
 		if r.MaxBotTurns < 1 {
 			fail("%s: max_bot_turns must be >= 1", where)
 		}
+		if r.BackgroundAfter != nil && r.BackgroundAfter != c.BackgroundAfter {
+			checkBackgroundAfter(where+": background_after", time.Duration(*r.BackgroundAfter), c.HermesTimeout, fail)
+		}
 		if r.Memory.BankID != "" && !bankIDRe.MatchString(r.Memory.BankID) {
 			fail("%s: memory.bank_id %q must match %s", where, r.Memory.BankID, bankIDRe)
 		}
 		if r.Memory.Retain.IdleMinutes < 0 || r.Memory.Retain.MinMessages < 0 {
 			fail("%s: memory.retain.idle_minutes and min_messages must be positive", where)
 		}
+	}
+}
+
+// Duration is a time.Duration ("20s", "1m30s") that also accepts a bare 0,
+// meaning off.
+type Duration time.Duration
+
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind == yaml.ScalarNode && n.Value == "0" {
+		*d = 0
+		return nil
+	}
+	var td time.Duration
+	if err := n.Decode(&td); err != nil {
+		return err
+	}
+	*d = Duration(td)
+	return nil
+}
+
+// checkBackgroundAfter: 0 (off) or a positive duration shorter than
+// hermes_timeout, which would otherwise stop every run first.
+func checkBackgroundAfter(key string, d, hermesTimeout time.Duration, fail func(string, ...any)) {
+	switch {
+	case d < 0:
+		fail("%s must be 0 (off) or a positive duration", key)
+	case d > 0 && hermesTimeout > 0 && d >= hermesTimeout:
+		fail("%s (%v) must be shorter than hermes_timeout (%v), or 0 to turn it off", key, d, hermesTimeout)
 	}
 }
 

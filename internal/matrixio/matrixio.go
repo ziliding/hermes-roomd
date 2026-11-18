@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/ziliding/hermes-roomd/internal/media"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -69,6 +70,58 @@ func (s *Sender) Send(ctx context.Context, roomID, text string) (string, error) 
 		return "", err
 	}
 	return string(resp.EventID), nil
+}
+
+// SendReply posts text like Send, as a Matrix reply (m.in_reply_to) to the
+// event inReplyTo.
+func (s *Sender) SendReply(ctx context.Context, roomID, text, inReplyTo string) (string, error) {
+	resp, err := s.cli.SendMessageEvent(ctx, id.RoomID(roomID), event.EventMessage, &event.MessageEventContent{
+		MsgType:   s.msgType,
+		Body:      text,
+		Mentions:  &event.Mentions{},
+		RelatesTo: &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: id.EventID(inReplyTo)}},
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(resp.EventID), nil
+}
+
+// SendImage uploads img to the homeserver's media repository as this bot
+// and posts it as an m.image (a reply to inReplyTo when that is set).
+func (s *Sender) SendImage(ctx context.Context, roomID string, img media.Image, inReplyTo string) (string, error) {
+	up, err := s.cli.UploadBytesWithName(ctx, img.Data, img.MIME, img.Filename())
+	if err != nil {
+		return "", fmt.Errorf("uploading image: %w", err)
+	}
+	content := &event.MessageEventContent{
+		MsgType:  event.MsgImage,
+		Body:     img.Body(),
+		FileName: img.Filename(),
+		URL:      up.ContentURI.CUString(),
+		Info:     &event.FileInfo{MimeType: img.MIME, Size: len(img.Data), Width: img.Width, Height: img.Height},
+		Mentions: &event.Mentions{},
+	}
+	if inReplyTo != "" {
+		content.RelatesTo = &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: id.EventID(inReplyTo)}}
+	}
+	resp, err := s.cli.SendMessageEvent(ctx, id.RoomID(roomID), event.EventMessage, content)
+	if err != nil {
+		return "", err
+	}
+	return string(resp.EventID), nil
+}
+
+// React annotates eventID with key (an m.reaction).
+func (s *Sender) React(ctx context.Context, roomID, eventID, key string) error {
+	_, err := s.cli.SendReaction(ctx, id.RoomID(roomID), id.EventID(eventID), key)
+	return err
+}
+
+// Typing shows (or clears) this bot as typing in the room for up to timeout.
+func (s *Sender) Typing(ctx context.Context, roomID string, typing bool, timeout time.Duration) error {
+	_, err := s.cli.UserTyping(ctx, id.RoomID(roomID), typing, timeout)
+	return err
 }
 
 // SendNotice posts roomd's own status text (not bot speech) as an m.notice

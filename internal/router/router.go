@@ -85,7 +85,7 @@ func (r *Router) Next(ctx context.Context, st turns.State, t turns.Trigger) (str
 		log.Debug("router: bot-turn cap reached; waiting for the user", "bot_turns", st.BotTurns)
 		return "", false, nil
 	}
-	if t.FromUser && t.Addressee != "" && r.isBot(t.Addressee) {
+	if t.FromUser && t.Addressee != "" && r.isBot(t.Addressee) && !st.IsBusy(t.Addressee) {
 		log.Debug("router: the user named a bot; it answers", "next", t.Addressee)
 		return t.Addressee, true, nil
 	}
@@ -123,6 +123,9 @@ func (r *Router) Next(ctx context.Context, st turns.State, t turns.Trigger) (str
 		return "", false, nil
 	case key == st.LastBot || (!t.FromUser && key == t.Sender):
 		log.Info("router: picked the bot that just spoke; nobody speaks", "name", name)
+		return "", false, nil
+	case st.IsBusy(key):
+		log.Info("router: picked a bot that is busy with a task; nobody speaks", "name", name)
 		return "", false, nil
 	}
 	log.Info("router: next speaker", "next", key)
@@ -178,6 +181,9 @@ func (r *Router) UserPrompt(st turns.State, t turns.Trigger, entries []transcrip
 	fmt.Fprintf(&b, "Characters have replied %d time(s) in a row since %s last wrote; at most %d are allowed.\n",
 		st.BotTurns, user, r.o.MaxBotTurns)
 	b.WriteString(r.participation(entries))
+	if busy := r.busyNames(st); len(busy) > 0 {
+		b.WriteString("Busy with a task and cannot be picked: " + strings.Join(busy, ", ") + ".\n")
+	}
 	b.WriteString(`Who speaks next? Answer {"next": "<character name>", "reason": "<a few words>"} or {"next": null, "reason": "<a few words>"}.`)
 	return b.String()
 }
@@ -207,6 +213,17 @@ func (r *Router) participation(entries []transcript.Entry) string {
 		b.WriteString("Not heard from above: " + strings.Join(quiet, ", ") + ".\n")
 	}
 	return b.String()
+}
+
+// busyNames lists the display names of busy bots, in cast order.
+func (r *Router) busyNames(st turns.State) []string {
+	var out []string
+	for _, p := range r.o.Roster.Bots() {
+		if st.IsBusy(p.Key) {
+			out = append(out, p.Display)
+		}
+	}
+	return out
 }
 
 type chatMessage struct {

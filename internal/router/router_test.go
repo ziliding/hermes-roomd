@@ -164,6 +164,19 @@ func TestPrompts(t *testing.T) {
 	}
 }
 
+func TestUserPromptListsBusyBots(t *testing.T) {
+	r := newRouter(newServer(t, 200, `{"next":null}`, 0), &recordingFallback{}, entries(), 0)
+	tr := entries()
+	st := turns.State{Busy: []string{"cleo", "ada"}}
+	got := r.UserPrompt(st, turns.Trigger{RoomID: room, FromUser: true}, tr.entries)
+	if !strings.Contains(got, "Busy with a task and cannot be picked: Ada, Cleo.\n") {
+		t.Fatalf("busy line missing:\n%s", got)
+	}
+	if strings.Contains(r.UserPrompt(turns.State{}, turns.Trigger{RoomID: room, FromUser: true}, tr.entries), "Busy") {
+		t.Fatal("busy line shown with nobody busy")
+	}
+}
+
 func TestNextAgainstServer(t *testing.T) {
 	afterAda := turns.State{BotTurns: 1, LastBot: "ada"}
 	adaSpoke := turns.Trigger{RoomID: room, Sender: "ada", Addressee: "cleo", Body: "A stakeout. Cleo, you coming."}
@@ -197,6 +210,8 @@ func TestNextAgainstServer(t *testing.T) {
 		{"bot asks the room a question: no call, nobody", 200, `{"next": "Cleo"}`, 0, afterAda, turns.Trigger{RoomID: room, Sender: "ada", Body: "What do you all think?"}, "", 0, 0},
 		{"bot asks the user by name: no call, nobody", 200, `{"next": "Cleo"}`, 0, afterAda, turns.Trigger{RoomID: room, Sender: "ada", Addressee: "cleo", Body: "Alex, should Cleo come too?"}, "", 0, 0},
 		{"bot asks another bot: router decides", 200, `{"next": "Cleo"}`, 0, afterAda, turns.Trigger{RoomID: room, Sender: "ada", Addressee: "cleo", Body: "Cleo, you coming?"}, "cleo", 1, 0},
+		{"busy pick means nobody", 200, `{"next": "Cleo"}`, 0, turns.State{BotTurns: 1, LastBot: "ada", Busy: []string{"cleo"}}, adaSpoke, "", 1, 0},
+		{"user names a busy bot: no shortcut, router decides", 200, `{"next": "Bram"}`, 0, turns.State{Busy: []string{"cleo"}}, turns.Trigger{RoomID: room, FromUser: true, Addressee: "cleo", Body: "Cleo?"}, "bram", 1, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
