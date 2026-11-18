@@ -185,6 +185,9 @@ Code, not the model, keeps the rules:
   line (system prompt, input, raw output, parsed plan, model, latency and
   the token usage the endpoint reports, including reasoning tokens), to
   build an eval set from.
+- **Eval replay:** `cmd/routereval` re-runs labelled call-log lines against
+  candidate models and reports accuracy per field, latency, tokens and cost.
+  See [evals/README.md](evals/README.md).
 - **Write real blurbs.** The router tells characters apart only by them, and
   roomd warns at startup when one is missing.
 
@@ -470,6 +473,7 @@ Requires Go ≥ 1.26 and builds as pure Go (no cgo, no libolm).
 
 ```
 cmd/roomd             wiring, config load, sync loops, signals
+cmd/routereval        replays labelled router calls against candidate models (evals/)
 internal/config       YAML → validated config; secrets from env
 internal/matrixio     per-bot senders, media download and the /sync listener
 internal/transcript   SQLite: messages, cursors, generations, steered messages, retain cursors

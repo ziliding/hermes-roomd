@@ -7,3 +7,7 @@ deploy/data/
 /roomd-linux
 dist/
 roomd-linux
+
+# router eval sets built from the call log hold real conversations
+evals/*.jsonl
+!evals/examples.jsonl
