@@ -11,6 +11,7 @@ package hermes
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -124,9 +125,50 @@ var ErrSteerRefused = errors.New("hermes: steer refused")
 
 type runRequest struct {
 	Model        string `json:"model,omitempty"`
-	Input        string `json:"input"`
+	Input        any    `json:"input"` // a string, or one user message with content parts
 	SessionID    string `json:"session_id"`
 	Instructions string `json:"instructions"`
+}
+
+// Image is a picture attached to a run's input. Label is a line of text put
+// right before it (who posted it, its name), so the model can refer to it.
+type Image struct {
+	Label string
+	MIME  string
+	Data  []byte
+}
+
+type contentPart struct {
+	Type     string    `json:"type"`
+	Text     string    `json:"text,omitempty"`
+	ImageURL *imageURL `json:"image_url,omitempty"`
+}
+
+type imageURL struct {
+	URL string `json:"url"`
+}
+
+type inputMessage struct {
+	Role    string        `json:"role"`
+	Content []contentPart `json:"content"`
+}
+
+// runInput is the plain text when there are no images; otherwise one user
+// message whose content is the text, then each image's label and the image
+// as a data URL (the OpenAI shape Hermes passes on to a vision model).
+func runInput(text string, images []Image) any {
+	if len(images) == 0 {
+		return text
+	}
+	parts := []contentPart{{Type: "text", Text: text}}
+	for _, img := range images {
+		if img.Label != "" {
+			parts = append(parts, contentPart{Type: "text", Text: img.Label})
+		}
+		url := "data:" + img.MIME + ";base64," + base64.StdEncoding.EncodeToString(img.Data)
+		parts = append(parts, contentPart{Type: "image_url", ImageURL: &imageURL{URL: url}})
+	}
+	return []inputMessage{{Role: "user", Content: parts}}
 }
 
 type runStatus struct {
@@ -142,9 +184,10 @@ type runStatus struct {
 }
 
 // Start creates a run for sessionID and returns its id. instructions is the
-// fixed system prompt (byte-identical on every call); input is the delta.
-func (c *Client) Start(ctx context.Context, sessionID, instructions, input string) (string, error) {
-	body, err := json.Marshal(runRequest{Model: c.Model, Input: input, SessionID: sessionID, Instructions: instructions})
+// fixed system prompt (byte-identical on every call); input is the delta,
+// and images (if any) are attached after it.
+func (c *Client) Start(ctx context.Context, sessionID, instructions, input string, images ...Image) (string, error) {
+	body, err := json.Marshal(runRequest{Model: c.Model, Input: runInput(input, images), SessionID: sessionID, Instructions: instructions})
 	if err != nil {
 		return "", err
 	}

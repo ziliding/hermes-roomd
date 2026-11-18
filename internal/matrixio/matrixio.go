@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"time"
 
@@ -29,6 +30,16 @@ type Message struct {
 	// Control marks roomd's own status notices (e.g. the /reset
 	// acknowledgement). They are never recorded as conversation.
 	Control bool
+	// Image is set for an m.image; Body is then its caption ("" for none).
+	Image *ImageRef
+}
+
+// ImageRef is an image message's media.
+type ImageRef struct {
+	URL  string // mxc://…
+	MIME string // from info.mimetype ("" when the sender gave none)
+	Name string // file name
+	Size int    // from info.size (0 when unknown)
 }
 
 // ControlKey is the custom content key roomd puts on its own status notices,
@@ -110,6 +121,27 @@ func (s *Sender) SendImage(ctx context.Context, roomID string, img media.Image, 
 		return "", err
 	}
 	return string(resp.EventID), nil
+}
+
+// Download fetches an mxc:// URI as this bot, refusing more than maxBytes.
+func (s *Sender) Download(ctx context.Context, mxc string, maxBytes int64) ([]byte, error) {
+	uri, err := id.ParseContentURI(mxc)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := s.cli.Download(ctx, uri)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("media larger than %d bytes", maxBytes)
+	}
+	return data, nil
 }
 
 // React annotates eventID with key (an m.reaction).
@@ -235,8 +267,17 @@ func toMessage(evt *event.Event) (Message, bool) {
 	if c.RelatesTo != nil && c.RelatesTo.GetReplaceID() != "" {
 		return Message{}, false // edit
 	}
+	var img *ImageRef
 	switch c.MsgType {
 	case event.MsgText, event.MsgNotice, event.MsgEmote:
+	case event.MsgImage:
+		if c.URL == "" { // an encrypted file (c.File): roomd can't read those
+			return Message{}, false
+		}
+		img = &ImageRef{URL: string(c.URL), Name: c.FileName}
+		if c.Info != nil {
+			img.MIME, img.Size = c.Info.MimeType, c.Info.Size
+		}
 	default:
 		return Message{}, false
 	}
@@ -249,6 +290,17 @@ func toMessage(evt *event.Event) (Message, bool) {
 	}
 	if v, ok := evt.Content.Raw[ControlKey].(bool); ok && v {
 		m.Control = true
+	}
+	if img != nil {
+		// Without a caption, body is the file name (older clients); with one,
+		// the file name is in filename and body is the caption.
+		if img.Name == "" {
+			img.Name = c.Body
+		}
+		if c.Body == img.Name {
+			m.Body = ""
+		}
+		m.Image = img
 	}
 	if c.Format == event.FormatHTML {
 		m.FormattedBody = c.FormattedBody

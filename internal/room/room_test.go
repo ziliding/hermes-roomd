@@ -22,7 +22,10 @@ import (
 
 const roomID = "!r:example.com"
 
-type call struct{ bot, session, system, delta, raw, run string }
+type call struct {
+	bot, session, system, delta, raw, run string
+	images                                []string // data URLs
+}
 
 // harness wires an Orchestrator to a fake Hermes Runs server (through the
 // real hermes.Client) and fake posters.
@@ -45,7 +48,10 @@ type harness struct {
 	// keepSteers: runs end with every accepted steer still in pending_steer.
 	keepSteers bool
 	imageFail  bool // SendImage fails
-	seq        int
+	// media is what Download serves, by mxc URI; downloads logs "bot: mxc".
+	media     map[string][]byte
+	downloads []string
+	seq       int
 }
 
 type harnessOpts struct {
@@ -65,7 +71,7 @@ func (h *harness) startServer() {
 	h.ctx = ctx
 	h.srv.Handle = func(s *hermestest.Server, r hermestest.Run) {
 		h.mu.Lock()
-		h.calls = append(h.calls, call{r.Profile, r.SessionID, r.Instructions, unframe(h.t, r.Input), r.Input, r.ID})
+		h.calls = append(h.calls, call{r.Profile, r.SessionID, r.Instructions, unframe(h.t, r.Input), r.Input, r.ID, r.Images})
 		n, gate, reply, keep := len(h.calls), h.gate, h.reply, h.keepSteers
 		h.mu.Unlock()
 		if gate != nil {
@@ -140,6 +146,20 @@ func (p fakePoster) SendImage(_ context.Context, _ string, img media.Image, inRe
 	p.h.posts = append(p.h.posts, post)
 	p.h.seq++
 	return fmt.Sprintf("$img%d", p.h.seq), nil
+}
+
+func (p fakePoster) Download(_ context.Context, mxc string, maxBytes int64) ([]byte, error) {
+	p.h.mu.Lock()
+	defer p.h.mu.Unlock()
+	p.h.downloads = append(p.h.downloads, p.bot+": "+mxc)
+	data, ok := p.h.media[mxc]
+	if !ok {
+		return nil, fmt.Errorf("M_NOT_FOUND")
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("too big")
+	}
+	return data, nil
 }
 
 func (p fakePoster) SendNotice(_ context.Context, _ string, text string) (string, error) {

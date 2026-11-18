@@ -51,6 +51,35 @@ func TestStartRequestShape(t *testing.T) {
 	}
 }
 
+func TestStartWithImagesSendsContentParts(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		io.WriteString(w, `{"run_id":"run_1"}`)
+	}))
+	defer srv.Close()
+	img := hermes.Image{Label: "Image from Alex (cat.png):", MIME: "image/png", Data: []byte{1, 2, 3}}
+	if _, err := hermes.New(srv.URL, "k", "").Start(context.Background(), "s", "sys", "look", img); err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"content":[{"text":"look","type":"text"},{"text":"Image from Alex (cat.png):","type":"text"},{"image_url":{"url":"data:image/png;base64,AQID"},"type":"image_url"}],"role":"user"}]`
+	if got, _ := json.Marshal(body["input"]); string(got) != want {
+		t.Fatalf("input %s", got)
+	}
+
+	// The fake server reads the same shape back.
+	fake := hermestest.New(t)
+	id, err := hermes.New(fake.BaseURL("ada"), "k", "").Start(context.Background(), "s", "sys", "look", img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := fake.Get(id)
+	if r.Input != "look\nImage from Alex (cat.png):" || len(r.Images) != 1 || r.Images[0] != "data:image/png;base64,AQID" {
+		t.Fatalf("fake saw %+v", r)
+	}
+}
+
 func TestRunReply(t *testing.T) {
 	tests := []struct {
 		name       string

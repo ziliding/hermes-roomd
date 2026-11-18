@@ -194,3 +194,63 @@ func TestSendImageUploadsThenPostsMImage(t *testing.T) {
 		t.Errorf("unexpected relation %v", sent["m.relates_to"])
 	}
 }
+
+func TestImageMessages(t *testing.T) {
+	tests := []struct {
+		name, content string
+		ok            bool
+		want          Message
+	}{
+		{"image without caption", `{"msgtype":"m.image","body":"cat.jpg","url":"mxc://example.com/a","info":{"mimetype":"image/jpeg","size":1234}}`,
+			true, Message{Image: &ImageRef{URL: "mxc://example.com/a", MIME: "image/jpeg", Name: "cat.jpg", Size: 1234}}},
+		{"image with caption", `{"msgtype":"m.image","body":"Ada, look at this","filename":"cat.jpg","url":"mxc://example.com/a","m.mentions":{"user_ids":["@ada:z"]}}`,
+			true, Message{Body: "Ada, look at this", Mentions: []string{"@ada:z"}, Image: &ImageRef{URL: "mxc://example.com/a", Name: "cat.jpg"}}},
+		{"encrypted image is dropped", `{"msgtype":"m.image","body":"cat.jpg","file":{"url":"mxc://example.com/a"}}`, false, Message{}},
+		{"video is dropped", `{"msgtype":"m.video","body":"v.mp4","url":"mxc://example.com/v"}`, false, Message{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			evt := &event.Event{Type: event.EventMessage, RoomID: "!r:z", ID: "$i", Sender: "@alex:z"}
+			if err := json.Unmarshal([]byte(tt.content), &evt.Content); err != nil {
+				t.Fatal(err)
+			}
+			if err := evt.Content.ParseRaw(evt.Type); err != nil {
+				t.Fatal(err)
+			}
+			m, ok := toMessage(evt)
+			if ok != tt.ok {
+				t.Fatalf("ok = %v (%+v)", ok, m)
+			}
+			if !ok {
+				return
+			}
+			if m.Body != tt.want.Body || strings.Join(m.Mentions, ",") != strings.Join(tt.want.Mentions, ",") || m.Image == nil || *m.Image != *tt.want.Image {
+				t.Fatalf("got %+v image %+v", m, m.Image)
+			}
+		})
+	}
+}
+
+func TestDownloadLimit(t *testing.T) {
+	var path string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		io.WriteString(w, "0123456789")
+	}))
+	defer srv.Close()
+	cli, err := mautrix.NewClient(srv.URL, "@ada:z", "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Sender{cli: cli}
+	data, err := s.Download(context.Background(), "mxc://example.com/abc", 10)
+	if err != nil || string(data) != "0123456789" || !strings.HasSuffix(path, "/download/example.com/abc") {
+		t.Fatalf("data %q err %v path %q", data, err, path)
+	}
+	if _, err := s.Download(context.Background(), "mxc://example.com/abc", 9); err == nil {
+		t.Fatal("over the limit must fail")
+	}
+	if _, err := s.Download(context.Background(), "https://example.com/x", 9); err == nil {
+		t.Fatal("not an mxc URI must fail")
+	}
+}

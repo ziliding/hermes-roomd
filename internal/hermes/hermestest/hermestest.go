@@ -19,7 +19,8 @@ type Run struct {
 	Profile      string
 	SessionID    string
 	Instructions string
-	Input        string
+	Input        string   // the text parts, joined by "\n"
+	Images       []string // image_url parts (data URLs), in order
 	Steers       []string // accepted steer texts, in order
 	Stopped      bool     // /stop was called while it ran
 	Status       string
@@ -149,11 +150,16 @@ func (s *Server) serve(w http.ResponseWriter, req *http.Request) {
 
 func (s *Server) start(w http.ResponseWriter, profile string, body []byte) {
 	var in struct {
-		Input        string `json:"input"`
-		SessionID    string `json:"session_id"`
-		Instructions string `json:"instructions"`
+		Input        json.RawMessage `json:"input"`
+		SessionID    string          `json:"session_id"`
+		Instructions string          `json:"instructions"`
 	}
-	if err := json.Unmarshal(body, &in); err != nil || in.Input == "" {
+	if err := json.Unmarshal(body, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "Invalid JSON")
+		return
+	}
+	text, images, ok := parseInput(in.Input)
+	if !ok || text == "" && len(images) == 0 {
 		writeErr(w, http.StatusBadRequest, "Missing 'input' field")
 		return
 	}
@@ -168,7 +174,7 @@ func (s *Server) start(w http.ResponseWriter, profile string, body []byte) {
 		}
 	}
 	id := "run_" + itoa(len(s.order)+1)
-	r := &Run{ID: id, Profile: profile, SessionID: in.SessionID, Instructions: in.Instructions, Input: in.Input, Status: "running"}
+	r := &Run{ID: id, Profile: profile, SessionID: in.SessionID, Instructions: in.Instructions, Input: text, Images: images, Status: "running"}
 	s.runs[id] = r
 	s.order = append(s.order, id)
 	snap := clone(r)
@@ -269,4 +275,45 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 func itoa(n int) string {
 	b, _ := json.Marshal(n)
 	return string(b)
+}
+
+// parseInput accepts a string, or a list of messages whose last one's content
+// is a string or a list of text and image_url parts (what Hermes reads).
+func parseInput(raw json.RawMessage) (text string, images []string, ok bool) {
+	if json.Unmarshal(raw, &text) == nil {
+		return text, nil, true
+	}
+	var msgs []struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(raw, &msgs) != nil || len(msgs) == 0 {
+		return "", nil, false
+	}
+	content := msgs[len(msgs)-1].Content
+	if json.Unmarshal(content, &text) == nil {
+		return text, nil, true
+	}
+	var parts []struct {
+		Type     string `json:"type"`
+		Text     string `json:"text"`
+		ImageURL struct {
+			URL string `json:"url"`
+		} `json:"image_url"`
+	}
+	if json.Unmarshal(content, &parts) != nil {
+		return "", nil, false
+	}
+	var texts []string
+	for _, p := range parts {
+		switch p.Type {
+		case "text":
+			texts = append(texts, p.Text)
+		case "image_url":
+			images = append(images, p.ImageURL.URL)
+		default:
+			return "", nil, false
+		}
+	}
+	return strings.Join(texts, "\n"), images, true
 }

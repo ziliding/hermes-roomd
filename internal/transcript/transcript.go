@@ -27,6 +27,10 @@ type Entry struct {
 	FormattedBody string
 	Mentions      []string // m.mentions user ids
 	TS            int64    // origin_server_ts, ms
+	// MediaURL is the mxc:// URI of an image message (Body then holds its
+	// text form, "[image: name] caption"); MediaMIME is its type.
+	MediaURL  string
+	MediaMIME string
 }
 
 // Store is the SQLite-backed transcript.
@@ -88,6 +92,14 @@ func Open(ctx context.Context, path string) (*Store, error) {
 			return nil, fmt.Errorf("transcript init: %w", err)
 		}
 	}
+	// Columns added after the first release: add them to older databases.
+	for _, col := range []string{"media_url", "media_mime"} {
+		_, err := db.ExecContext(ctx, `ALTER TABLE messages ADD COLUMN `+col+` TEXT NOT NULL DEFAULT ''`)
+		if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("transcript migrate %s: %w", col, err)
+		}
+	}
 	return &Store{db: db}, nil
 }
 
@@ -97,9 +109,9 @@ func (s *Store) Close() error { return s.db.Close() }
 // Append records e once (duplicate event ids are ignored) and returns its seq.
 func (s *Store) Append(ctx context.Context, e Entry) (int64, error) {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT OR IGNORE INTO messages(room_id, event_id, sender, body, formatted_body, mentions, ts)
-		 VALUES(?,?,?,?,?,?,?)`,
-		e.RoomID, e.EventID, e.Sender, e.Body, e.FormattedBody, joinIDs(e.Mentions), e.TS)
+		`INSERT OR IGNORE INTO messages(room_id, event_id, sender, body, formatted_body, mentions, ts, media_url, media_mime)
+		 VALUES(?,?,?,?,?,?,?,?,?)`,
+		e.RoomID, e.EventID, e.Sender, e.Body, e.FormattedBody, joinIDs(e.Mentions), e.TS, e.MediaURL, e.MediaMIME)
 	if err != nil {
 		return 0, err
 	}
@@ -112,7 +124,7 @@ func (s *Store) Append(ctx context.Context, e Entry) (int64, error) {
 // newest limit entries when there are more.
 func (s *Store) Since(ctx context.Context, roomID string, after int64, limit int) ([]Entry, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT seq, room_id, event_id, sender, body, formatted_body, mentions, ts FROM (
+		`SELECT seq, room_id, event_id, sender, body, formatted_body, mentions, ts, media_url, media_mime FROM (
 			SELECT * FROM messages WHERE room_id = ? AND seq > ? ORDER BY seq DESC LIMIT ?
 		 ) ORDER BY seq ASC`, roomID, after, limit)
 	if err != nil {
@@ -123,7 +135,7 @@ func (s *Store) Since(ctx context.Context, roomID string, after int64, limit int
 	for rows.Next() {
 		var e Entry
 		var mentions string
-		if err := rows.Scan(&e.Seq, &e.RoomID, &e.EventID, &e.Sender, &e.Body, &e.FormattedBody, &mentions, &e.TS); err != nil {
+		if err := rows.Scan(&e.Seq, &e.RoomID, &e.EventID, &e.Sender, &e.Body, &e.FormattedBody, &mentions, &e.TS, &e.MediaURL, &e.MediaMIME); err != nil {
 			return nil, err
 		}
 		e.Mentions = splitIDs(mentions)
@@ -257,7 +269,7 @@ func (s *Store) After(ctx context.Context, roomID string, after, upTo int64, lim
 		upTo = 1<<63 - 1
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT seq, room_id, event_id, sender, body, formatted_body, mentions, ts FROM messages
+		`SELECT seq, room_id, event_id, sender, body, formatted_body, mentions, ts, media_url, media_mime FROM messages
 		 WHERE room_id = ? AND seq > ? AND seq <= ? ORDER BY seq ASC LIMIT ?`, roomID, after, upTo, limit)
 	if err != nil {
 		return nil, err
@@ -267,7 +279,7 @@ func (s *Store) After(ctx context.Context, roomID string, after, upTo int64, lim
 	for rows.Next() {
 		var e Entry
 		var mentions string
-		if err := rows.Scan(&e.Seq, &e.RoomID, &e.EventID, &e.Sender, &e.Body, &e.FormattedBody, &mentions, &e.TS); err != nil {
+		if err := rows.Scan(&e.Seq, &e.RoomID, &e.EventID, &e.Sender, &e.Body, &e.FormattedBody, &mentions, &e.TS, &e.MediaURL, &e.MediaMIME); err != nil {
 			return nil, err
 		}
 		e.Mentions = splitIDs(mentions)

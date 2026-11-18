@@ -160,3 +160,5 @@ func retainersRunOnce(ctx context.Context, rs []*memory.Retainer) {
 		r.RunOnce(ctx)
 	}
 }
+
+func (nopPoster) Download(context.Context, string, int64) ([]byte, error) { return nil, nil }

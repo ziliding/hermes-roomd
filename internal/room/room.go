@@ -26,7 +26,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -54,11 +56,13 @@ type Poster interface {
 	SendNotice(ctx context.Context, roomID, text string) (string, error)
 	React(ctx context.Context, roomID, eventID, key string) error
 	Typing(ctx context.Context, roomID string, typing bool, timeout time.Duration) error
+	// Download fetches an mxc:// URI as the bot, refusing more than maxBytes.
+	Download(ctx context.Context, mxc string, maxBytes int64) ([]byte, error)
 }
 
 // Runner drives runs on one bot's Hermes profile (see hermes.Client).
 type Runner interface {
-	Start(ctx context.Context, sessionID, instructions, input string) (string, error)
+	Start(ctx context.Context, sessionID, instructions, input string, images ...hermes.Image) (string, error)
 	Status(ctx context.Context, runID string) (hermes.Run, error)
 	Steer(ctx context.Context, runID, text string) error
 	Stop(ctx context.Context, runID string) error
@@ -251,7 +255,7 @@ func (o *Orchestrator) Handle(ctx context.Context, m matrixio.Message) {
 		o.log.Debug("dropped roomd's own notice", "room", m.RoomID, "event", m.EventID)
 		return
 	}
-	if m.Sender == w.roster.User().MXID {
+	if m.Sender == w.roster.User().MXID && m.Image == nil {
 		if cmd, ok := commands.Parse(m.Body); ok {
 			o.enqueueCommand(ctx, w, m, cmd)
 			return
@@ -468,6 +472,11 @@ func (o *Orchestrator) steer(ctx context.Context, w *worker, q queued) bool {
 		return false
 	}
 	log := o.log.With("room", w.id, "bot", addr, "run", j.runID, "event", q.msg.EventID)
+	if q.msg.Image != nil {
+		// Steer input is text only: the image waits for the bot's next turn.
+		log.Info("image for a busy bot; it waits for the bot's next turn")
+		return true
+	}
 	e := entryOf(q.msg)
 	e.Seq = q.seq
 	text := w.builder.Build(addr, []transcript.Entry{e})
@@ -606,7 +615,12 @@ func (o *Orchestrator) speak(ctx context.Context, w *worker, botKey, instruction
 		memory, memIDs = w.memory.Block(ctx, roomID, sid)
 	}
 	start := o.now()
-	runID, err := bot.Hermes.Start(ctx, sid, bot.System, FrameMemory(delta, person.Display, instruction, memory))
+	images, notes := o.images(ctx, w, bot.Poster, person.MXID, fresh, log)
+	input := FrameMemory(delta, person.Display, instruction, memory)
+	if len(images) > 0 || len(notes) > 0 {
+		input += "\n\n" + imagesNote(len(images), notes)
+	}
+	runID, err := bot.Hermes.Start(ctx, sid, bot.System, input, images...)
 	if err != nil {
 		// Cursor stays put: the same delta is offered next time.
 		log.Error("starting hermes run", "session", sid, "err", err)
@@ -1018,8 +1032,99 @@ func StripSelfLabel(text, display string) string {
 }
 
 func entryOf(m matrixio.Message) transcript.Entry {
-	return transcript.Entry{
+	e := transcript.Entry{
 		RoomID: m.RoomID, EventID: m.EventID, Sender: m.Sender, Body: m.Body,
 		FormattedBody: m.FormattedBody, Mentions: m.Mentions, TS: m.TS,
 	}
+	if m.Image != nil {
+		e.Body = strings.TrimSpace(imageLine(m.Image.Name) + " " + m.Body)
+		e.FormattedBody = ""
+		e.MediaURL, e.MediaMIME = m.Image.URL, m.Image.MIME
+	}
+	return e
+}
+
+// imageLine is how an image someone posted reads in the transcript.
+func imageLine(name string) string {
+	if name == "" {
+		return media.Placeholder
+	}
+	return "[image: " + name + "]"
+}
+
+// MaxImages is the most images attached to one run; older ones in the same
+// delta are mentioned but not sent.
+const MaxImages = 4
+
+// images downloads (as the bot) the images posted in entries by anyone else
+// and returns them labelled for the run input, newest MaxImages at most. An
+// image that can't be used becomes a short note instead.
+func (o *Orchestrator) images(ctx context.Context, w *worker, p Poster, self string, entries []transcript.Entry, log *slog.Logger) ([]hermes.Image, []string) {
+	var posted []transcript.Entry
+	for _, e := range entries {
+		if e.MediaURL != "" && e.Sender != self {
+			posted = append(posted, e)
+		}
+	}
+	var notes []string
+	if extra := len(posted) - MaxImages; extra > 0 {
+		for _, e := range posted[:extra] {
+			notes = append(notes, describeImage(w, e)+" is not attached (at most "+strconv.Itoa(MaxImages)+" images per turn).")
+		}
+		posted = posted[extra:]
+	}
+	var out []hermes.Image
+	for _, e := range posted {
+		data, err := p.Download(ctx, e.MediaURL, media.MaxFileBytes)
+		mime := ""
+		if err == nil {
+			if mime = http.DetectContentType(data); !strings.HasPrefix(mime, "image/") {
+				err = fmt.Errorf("not an image (%s)", mime)
+			}
+		}
+		if err != nil {
+			log.Warn("image not attached", "event", e.EventID, "url", e.MediaURL, "err", err)
+			notes = append(notes, describeImage(w, e)+" could not be loaded.")
+			continue
+		}
+		out = append(out, hermes.Image{Label: describeImage(w, e) + ":", MIME: mime, Data: data})
+	}
+	return out, notes
+}
+
+// describeImage names an image by who posted it and its file name.
+func describeImage(w *worker, e transcript.Entry) string {
+	s := "Image from " + w.roster.DisplayFor(e.Sender)
+	if name := imageName(e.Body); name != "" {
+		s += " (" + name + ")"
+	}
+	return s
+}
+
+func imageName(body string) string {
+	if rest, ok := strings.CutPrefix(body, "[image: "); ok {
+		if name, _, ok := strings.Cut(rest, "]"); ok {
+			return name
+		}
+	}
+	return ""
+}
+
+// imagesNote tells the bot about the attached images (and any left out).
+func imagesNote(n int, notes []string) string {
+	var b strings.Builder
+	switch n {
+	case 0:
+	case 1:
+		b.WriteString("The image posted above is attached after this text; look at it.")
+	default:
+		b.WriteString("The " + strconv.Itoa(n) + " images posted above are attached after this text, in order; look at them.")
+	}
+	for _, note := range notes {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(note)
+	}
+	return b.String()
 }

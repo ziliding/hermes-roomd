@@ -41,9 +41,26 @@ recorded but never trigger anything on their own.
 
 ### Images
 
-roomd posts a bot's images as real Matrix images: it uploads each one to
-the homeserver as that bot and sends an `m.image`. It recognises three
-shapes in a reply:
+**Images you post** reach the bots as real images, so a vision model can
+look at them:
+
+- roomd reads unencrypted `m.image` messages. The transcript records
+  `[image: name] caption` and the image's `mxc://` URL, never its data.
+- On a bot's next turn, roomd downloads each image in its delta as that bot
+  and attaches it to the run input as an `image_url` part (a data URL),
+  after a label such as `Image from Alex (cat.png):`. Each image reaches
+  each bot once, like the text around it.
+- At most 4 images (the newest) and 10 MB each go into one run. Older ones,
+  and ones that can't be downloaded or aren't images, become a one-line
+  note in the input instead.
+- An image is never steered into a busy bot's run (steer input is text
+  only); it waits for that bot's next turn.
+- The bots' model must accept images. A text-only model rejects the run
+  or ignores them, depending on the provider.
+
+**Images a bot posts** go out as real Matrix images: roomd uploads each
+one to the homeserver as that bot and sends an `m.image`. roomd
+recognises three shapes in a reply:
 
 - **`MEDIA:/path/to/file.png` tags** and **bare absolute paths** ending in
   `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` or `.bmp`. Hermes' Runs API
@@ -128,6 +145,8 @@ run carries only two things:
   - Mentions are rewritten to `(to Ada)`.
   - Message text is escaped, so it can't fake another speaker.
   - The bot's own messages are left out, because Hermes already holds them.
+  - Images posted in those messages are attached after the text (see
+    [Images](#images)).
 
 Before posting, roomd cleans the reply. It unwraps a reply the model wrapped
 in its own `<msg>` element, drops text written for other speakers and echoed
@@ -385,7 +404,7 @@ Requires Go ≥ 1.26 and builds as pure Go (no cgo, no libolm).
 ```
 cmd/roomd             wiring, config load, sync loops, signals
 internal/config       YAML → validated config; secrets from env
-internal/matrixio     per-bot senders and the /sync listener
+internal/matrixio     per-bot senders, media download and the /sync listener
 internal/transcript   SQLite: messages, cursors, generations, steered messages, retain cursors
 internal/roster       who is who; addressee and pill detection
 internal/contextbuild delta → <msg from="Name"> elements, mention rewriting
