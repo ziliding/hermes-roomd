@@ -116,5 +116,5 @@ memory:
     timeout: 2m                      # per summarizer call and per Hindsight retain call
     # summary:                       # the summary-mode model; each field left out takes the router's
     #   base_url: https://api.venice.ai/api/v1
-    #   model: glm-5.3               # infrequent task: a stronger model than the per-turn router is affordable
+    #   model: z-ai-glm-5-3          # infrequent task: a stronger model than the per-turn router is affordable
     #   key_env: ROOMD_SUMMARY_KEY
