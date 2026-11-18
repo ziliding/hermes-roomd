@@ -23,8 +23,8 @@ func TestRouterOnlyPicksFromRoomCast(t *testing.T) {
 	tests := []struct {
 		answer, want string
 	}{
-		{`{"next":"Cleo"}`, "cleo"},
-		{`{"next":"Bram"}`, ""}, // configured globally, but not in this room
+		{`{"plan":["Cleo"]}`, "cleo"},
+		{`{"plan":["Bram"]}`, ""}, // configured globally, but not in this room
 	}
 	for _, tt := range tests {
 		s := newServer(t, 200, tt.answer, 0)
@@ -35,9 +35,9 @@ func TestRouterOnlyPicksFromRoomCast(t *testing.T) {
 			MaxBotTurns: 2, Fallback: turns.NewRules([]string{"ada", "cleo"}, 2, rand.New(rand.NewPCG(1, 1))),
 			Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		})
-		got, ok, err := r.Next(context.Background(), turns.State{}, turns.Trigger{RoomID: room, FromUser: true, Body: "hi all"})
-		if err != nil || got != tt.want || ok != (tt.want != "") {
-			t.Errorf("answer %s: got %q ok=%v err=%v, want %q", tt.answer, got, ok, err, tt.want)
+		plan, err := r.Plan(context.Background(), turns.State{}, turns.Trigger{RoomID: room, FromUser: true, Body: "hi all"})
+		if got := strings.Join(plan, ","); err != nil || got != tt.want {
+			t.Errorf("answer %s: got %q err=%v, want %q", tt.answer, got, err, tt.want)
 		}
 		if strings.Contains(r.system, "Bram") || strings.Contains(r.system, "librarian") {
 			t.Errorf("router prompt mentions a bot outside the room's cast:\n%s", r.system)

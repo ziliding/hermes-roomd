@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/ziliding/hermes-roomd/internal/roster"
 )
 
 // MsgType is the Matrix msgtype roomd posts bot replies with.
@@ -65,6 +67,10 @@ type Router struct {
 	// JSONMode sends response_format {"type":"json_object"}. Default true;
 	// set false for endpoints that reject the parameter.
 	JSONMode *bool `yaml:"json_mode"`
+	// LogFile, if set, gets one JSON line per router call (input, output,
+	// model, latency, tokens), for building an eval set. Relative to the
+	// config file's folder.
+	LogFile string `yaml:"log_file"`
 
 	Key string `yaml:"-"` // resolved from KeyEnv
 }
@@ -236,12 +242,15 @@ func (c *Config) ListenerGroups() map[string][]string {
 
 // Config is the whole roomd configuration.
 type Config struct {
-	Homeserver     string        `yaml:"homeserver"`
-	User           string        `yaml:"user"`
-	UserDisplay    string        `yaml:"user_display"`
-	Rooms          []*Room       `yaml:"rooms"`
-	MaxBotTurns    int           `yaml:"max_bot_turns"`
-	MaxDeltaLines  int           `yaml:"max_delta_lines"`
+	Homeserver    string  `yaml:"homeserver"`
+	User          string  `yaml:"user"`
+	UserDisplay   string  `yaml:"user_display"`
+	Rooms         []*Room `yaml:"rooms"`
+	MaxBotTurns   int     `yaml:"max_bot_turns"`
+	MaxDeltaLines int     `yaml:"max_delta_lines"`
+	// GroupWords address every bot at once ("你们", "everyone"); each then
+	// owes the user a reply. Absent: roster.DefaultGroupWords; []: none.
+	GroupWords     []string      `yaml:"group_words"`
 	MsgType        MsgType       `yaml:"msgtype"`
 	StateDB        string        `yaml:"state_db"`
 	GroupRulesFile string        `yaml:"group_rules_file"`
@@ -296,6 +305,9 @@ func Load(path string) (*Config, error) {
 	dir := filepath.Dir(path)
 	if !filepath.IsAbs(cfg.StateDB) {
 		cfg.StateDB = filepath.Join(dir, cfg.StateDB)
+	}
+	if cfg.Router.LogFile != "" && !filepath.IsAbs(cfg.Router.LogFile) {
+		cfg.Router.LogFile = filepath.Join(dir, cfg.Router.LogFile)
 	}
 	if !filepath.IsAbs(cfg.GroupRulesFile) {
 		cfg.GroupRulesFile = filepath.Join(dir, cfg.GroupRulesFile)
@@ -353,6 +365,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxDeltaLines == 0 {
 		c.MaxDeltaLines = DefaultMaxDeltaLines
+	}
+	if c.GroupWords == nil {
+		c.GroupWords = roster.DefaultGroupWords
 	}
 	if c.MsgType == "" {
 		c.MsgType = MsgText

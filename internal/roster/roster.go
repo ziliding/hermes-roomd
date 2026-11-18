@@ -6,6 +6,7 @@ package roster
 import (
 	"html"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -76,14 +77,21 @@ func Localpart(mxid string) string {
 	return s
 }
 
-// Addressee returns the key of the single bot a message is addressed to, or
-// "" when it names none. At most one addressee is ever counted: the bot whose
-// name or handle appears earliest in the body; bots only present in
-// m.mentions / pills rank after any named in the text, in list order. The
-// sender (exclude) never counts, so a bot naming itself addresses nobody.
+// Addressee returns the key of the bot a message is addressed to first, or
+// "" when it names none (see Addressees).
 func (r *Roster) Addressee(body, formattedBody string, mentions []string, exclude string) string {
+	if all := r.Addressees(body, formattedBody, mentions, exclude); len(all) > 0 {
+		return all[0]
+	}
+	return ""
+}
+
+// Addressees returns the keys of every bot a message names, in the order
+// they are named: bots whose name or handle appears in the body by position,
+// then bots only present in m.mentions / pills, in list order. The sender
+// (exclude) never counts, so a bot naming itself addresses nobody.
+func (r *Roster) Addressees(body, formattedBody string, mentions []string, exclude string) []string {
 	const notInText = int(^uint(0) >> 1)
-	best, bestPos := "", notInText
 	hinted := map[string]int{} // key -> order among explicit mentions
 	for i, id := range append(append([]string{}, mentions...), PillTargets(formattedBody)...) {
 		if p, ok := r.byMXID[id]; ok && p.IsBot {
@@ -92,21 +100,27 @@ func (r *Roster) Addressee(body, formattedBody string, mentions []string, exclud
 			}
 		}
 	}
+	type named struct {
+		key string
+		pos int
+	}
+	var found []named
 	for _, p := range r.Bots() {
 		if p.Key == exclude {
 			continue
 		}
-		pos := notInText
 		if loc := p.nameRe.FindStringIndex(body); loc != nil {
-			pos = loc[0]
+			found = append(found, named{p.Key, loc[0]})
 		} else if order, ok := hinted[p.Key]; ok {
-			pos = notInText - 1000 + order // explicit mention not visible in body text
-		}
-		if pos < bestPos {
-			best, bestPos = p.Key, pos
+			found = append(found, named{p.Key, notInText - 1000 + order}) // explicit mention not visible in body text
 		}
 	}
-	return best
+	sort.SliceStable(found, func(i, j int) bool { return found[i].pos < found[j].pos })
+	out := make([]string, len(found))
+	for i, f := range found {
+		out[i] = f.key
+	}
+	return out
 }
 
 // NamePos returns the byte offset in body where participant key is first

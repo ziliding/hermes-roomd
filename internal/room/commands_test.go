@@ -36,7 +36,7 @@ func (h *harness) latestSeq() int64 {
 }
 
 func TestResetBumpsGenerationsAndMovesCursors(t *testing.T) {
-	h := newHarness(t, 2, func(bot string, n int) string { return "reply " + bot })
+	h := newHarness(t, 1, func(bot string, n int) string { return "reply " + bot })
 	h.runOne("Cleo, hello") // cleo then ada speak in generation 1
 	before := h.latestSeq()
 
@@ -79,7 +79,7 @@ func TestResetBumpsGenerationsAndMovesCursors(t *testing.T) {
 // A message sent right after /reset must still reach the bots: the cursor
 // moves to the newest seq when /reset arrived, not when it ran.
 func TestResetDoesNotHideALaterMessage(t *testing.T) {
-	h := newHarness(t, 1, func(bot string, n int) string { return "ok" })
+	h := newHarness(t, 0, func(bot string, n int) string { return "ok" })
 	h.runOne("Ada, hi")
 	ctx := context.Background()
 	h.o.Handle(ctx, h.user("/reset"))
@@ -99,7 +99,7 @@ func TestResetDoesNotHideALaterMessage(t *testing.T) {
 }
 
 func TestResetDiscardsInFlightReply(t *testing.T) {
-	h := newHarness(t, 2, func(bot string, n int) string { return "old-session reply" })
+	h := newHarness(t, 1, func(bot string, n int) string { return "old-session reply" })
 	h.gate = make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -118,7 +118,7 @@ func TestResetDiscardsInFlightReply(t *testing.T) {
 }
 
 func TestCommandsFromOthersAreConversation(t *testing.T) {
-	h := newHarness(t, 2, func(bot string, n int) string { return "x" })
+	h := newHarness(t, 1, func(bot string, n int) string { return "x" })
 	ctx := context.Background()
 	for i, sender := range []string{"@ada:z", "@stranger:z"} {
 		h.o.Handle(ctx, matrixio.Message{RoomID: roomID, EventID: "$o" + string(rune('a'+i)), Sender: sender, Body: "/reset", TS: 1})
@@ -136,7 +136,7 @@ func TestCommandsFromOthersAreConversation(t *testing.T) {
 }
 
 func TestExplain(t *testing.T) {
-	h := newHarness(t, 2, func(bot string, n int) string { return "plainly: " + bot })
+	h := newHarness(t, 1, func(bot string, n int) string { return "plainly: " + bot })
 	h.runCmd(h.user("!explain"))
 	if len(h.calls) != 0 || len(h.notices) != 1 || !strings.Contains(h.notices[0], "no bot has spoken") {
 		t.Fatalf("explain with no speaker: calls=%d notices=%v", len(h.calls), h.notices)
@@ -176,19 +176,19 @@ type blockingDecider struct {
 	release chan struct{}
 }
 
-func (d blockingDecider) Next(_ context.Context, st turns.State, t turns.Trigger) (string, bool, error) {
+func (d blockingDecider) Plan(_ context.Context, st turns.State, t turns.Trigger) ([]string, error) {
 	d.entered <- struct{}{}
 	<-d.release
-	if st.BotTurns > 0 {
-		return "", false, nil
+	if !t.FromUser {
+		return nil, nil
 	}
-	return "ada", true, nil
+	return []string{"ada"}, nil
 }
 
 // /reset arriving while the router is still deciding: the stale decision is
 // dropped (no old-session call), and the next turn starts on g2.
 func TestResetDuringSlowDecision(t *testing.T) {
-	h := newHarness(t, 2, func(bot string, n int) string { return "reply " + bot })
+	h := newHarness(t, 1, func(bot string, n int) string { return "reply " + bot })
 	d := blockingDecider{entered: make(chan struct{}), release: make(chan struct{})}
 	h.o.rooms[roomID].decider = d
 	ctx, cancel := context.WithCancel(context.Background())

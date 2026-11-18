@@ -1,6 +1,7 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -8,6 +9,8 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -42,12 +45,12 @@ func (f *fakeTranscript) Since(_ context.Context, roomID string, after int64, li
 // recordingFallback is a Decider that records that it was asked.
 type recordingFallback struct {
 	calls atomic.Int32
-	next  string
+	plan  []string
 }
 
-func (f *recordingFallback) Next(context.Context, turns.State, turns.Trigger) (string, bool, error) {
+func (f *recordingFallback) Plan(context.Context, turns.State, turns.Trigger) ([]string, error) {
 	f.calls.Add(1)
-	return f.next, f.next != "", nil
+	return f.plan, nil
 }
 
 type server struct {
@@ -107,47 +110,62 @@ func entries() *fakeTranscript {
 
 func TestParseAnswer(t *testing.T) {
 	tests := []struct {
-		name, in, want string
-		wantErr        bool
+		name    string
+		in      string
+		want    Answer
+		wantErr bool
 	}{
-		{"name", `{"next": "Cleo"}`, "Cleo", false},
-		{"null", `{"next": null}`, "", false},
-		{"string null", `{"next": "null"}`, "", false},
-		{"empty string", `{"next": ""}`, "", false},
-		{"none", `{"next": "None"}`, "", false},
-		{"at-name", `{"next": "@cleo"}`, "cleo", false},
-		{"code fence", "```json\n{\"next\": \"Ada\"}\n```", "Ada", false},
-		{"think block with braces", "<think>maybe {\"next\": \"Cleo\"}? no.</think>\n{\"next\": null}", "", false},
-		{"prose around", `Sure! {"next": "Bram"} is my pick.`, "Bram", false},
-		{"extra fields", `{"reason": "asked", "next": "Cleo"}`, "Cleo", false},
-		{"non-string reason ignored", `{"next": "Cleo", "reason": 7}`, "Cleo", false},
-		{"skips objects without next", `{"a":1} then {"next":"Ada"}`, "Ada", false},
-		{"not JSON", `Cleo should speak`, "", true},
-		{"missing next", `{"speaker": "Cleo"}`, "", true},
-		{"number", `{"next": 3}`, "", true},
-		{"list", `{"next": ["Cleo","Ada"]}`, "", true},
-		{"truncated", `{"next": "Ut`, "", true},
-		{"empty", ``, "", true},
+		{"full", `{"addressed_to": ["Cleo","Ada"], "user_question_pending": false, "plan": ["Cleo","Ada"], "reason": " both named "}`,
+			Answer{AddressedTo: []string{"Cleo", "Ada"}, Plan: []string{"Cleo", "Ada"}, Reason: "both named"}, false},
+		{"all", `{"addressed_to": "all", "user_question_pending": false, "plan": ["Ada"]}`, Answer{All: true, Plan: []string{"Ada"}}, false},
+		{"user and pending", `{"addressed_to": "user", "user_question_pending": true, "plan": []}`, Answer{ToUser: true, UserPending: true}, false},
+		{"none", `{"addressed_to": "none", "user_question_pending": false, "plan": []}`, Answer{NoReply: true}, false},
+		{"plan as a single name", `{"plan": "@Cleo"}`, Answer{Plan: []string{"Cleo"}}, false},
+		{"null plan", `{"plan": null}`, Answer{}, false},
+		{"pending as a string", `{"user_question_pending": "true", "plan": []}`, Answer{UserPending: true}, false},
+		{"code fence", "```json\n{\"plan\": [\"Ada\"]}\n```", Answer{Plan: []string{"Ada"}}, false},
+		{"think block with braces", "<think>maybe {\"plan\": [\"Cleo\"]}? no.</think>\n{\"plan\": []}", Answer{}, false},
+		{"prose around", `Sure! {"plan": ["Bram"]} is my pick.`, Answer{Plan: []string{"Bram"}}, false},
+		{"skips objects without plan", `{"a":1} then {"plan":["Ada"]}`, Answer{Plan: []string{"Ada"}}, false},
+		{"old single-speaker shape", `{"next": "Cleo"}`, Answer{}, true},
+		{"not JSON", `Cleo should speak`, Answer{}, true},
+		{"number plan", `{"plan": 3}`, Answer{}, true},
+		{"bad pending", `{"plan": [], "user_question_pending": "maybe"}`, Answer{}, true},
+		{"truncated", `{"plan": ["Ut`, Answer{}, true},
+		{"empty", ``, Answer{}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ans, err := ParseAnswer(tt.in)
-			got := ans.Next
-			if (err != nil) != tt.wantErr || got != tt.want {
-				t.Fatalf("ParseAnswer(%q) = %q, %v; want %q, err=%v", tt.in, got, err, tt.want, tt.wantErr)
+			got, err := ParseAnswer(tt.in)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ParseAnswer(%q) err = %v, want err=%v", tt.in, err, tt.wantErr)
+			}
+			if !tt.wantErr && !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("ParseAnswer(%q) = %+v, want %+v", tt.in, got, tt.want)
 			}
 		})
 	}
 }
 
+func TestAddressedKeepsKeywords(t *testing.T) {
+	a, _ := ParseAnswer(`{"addressed_to": ["all", "Cleo"], "plan": []}`)
+	if got := a.Addressed(); !slices.Equal(got, []string{"all", "Cleo"}) {
+		t.Fatalf("Addressed() = %v", got)
+	}
+}
+
 func TestPrompts(t *testing.T) {
 	sys := SystemPrompt(testRoster, map[string]string{"ada": "a detective", "cleo": "a singer"})
-	for _, want := range []string{"- Ada: a detective\n", "- Cleo: a singer\n", "- Bram\n", `{"next": null`, "null is the default", "between Alex (a human)", "JSON", "favour characters who have been quiet"} {
+	for _, want := range []string{"- Ada: a detective\n", "- Cleo: a singer\n", "- Bram\n", `"addressed_to"`, `"user_question_pending"`,
+		"MAIN point", "你们觉得呢?", "question in passing", "between Alex (a human)", "You cannot drop them"} {
 		if !strings.Contains(sys, want) {
 			t.Errorf("system prompt lacks %q:\n%s", want, sys)
 		}
 	}
-	r := newRouter(newServer(t, 200, `{"next":null}`, 0), &recordingFallback{}, entries(), 0)
+	if strings.Index(sys, `"addressed_to"`) > strings.Index(sys, `"plan"`) {
+		t.Error("the analysis fields must come before plan")
+	}
+	r := newRouter(newServer(t, 200, `{"plan":[]}`, 0), &recordingFallback{}, entries(), 0)
 	tr := entries()
 	got := r.UserPrompt(turns.State{BotTurns: 1, LastBot: "ada"}, turns.Trigger{RoomID: room, Sender: "ada"}, tr.entries[1:])
 	want := "Recent messages, oldest first:\n<messages>\n" +
@@ -155,17 +173,25 @@ func TestPrompts(t *testing.T) {
 		"<msg from=\"Ada\">A stakeout. Cleo, you coming?</msg>\n" +
 		"</messages>\n\n" +
 		"The latest message is from Ada, who just spoke and cannot be picked.\n" +
-		"Characters have replied 1 time(s) in a row since Alex last wrote; at most 2 are allowed.\n" +
+		"Nobody owes Alex a reply. Characters have replied to each other 1 time(s) since Alex last wrote; at most 2 are allowed.\n" +
 		"Messages per character above: Ada 1.\n" +
 		"Not heard from above: Cleo, Bram.\n" +
-		`Who speaks next? Answer {"next": "<character name>", "reason": "<a few words>"} or {"next": null, "reason": "<a few words>"}.`
+		`Answer {"addressed_to": ..., "user_question_pending": ..., "plan": [...], "reason": "..."}.`
 	if got != want {
 		t.Fatalf("user prompt:\n%s\nwant:\n%s", got, want)
+	}
+	owed := r.UserPrompt(turns.State{LastBot: "ada", Owed: []string{"bram", "cleo"}}, turns.Trigger{RoomID: room, Sender: "ada"}, tr.entries)
+	if !strings.Contains(owed, "Still owe Alex a reply to their latest message: Cleo, Bram.\n") || strings.Contains(owed, "Nobody owes") {
+		t.Fatalf("owed line wrong:\n%s", owed)
+	}
+	handoff := r.UserPrompt(turns.State{LastBot: "ada"}, turns.Trigger{RoomID: room, Sender: "ada", Handoff: true}, tr.entries)
+	if !strings.Contains(handoff, "Ada has taken on the latest request as a task") {
+		t.Fatalf("hand-off line missing:\n%s", handoff)
 	}
 }
 
 func TestUserPromptListsBusyBots(t *testing.T) {
-	r := newRouter(newServer(t, 200, `{"next":null}`, 0), &recordingFallback{}, entries(), 0)
+	r := newRouter(newServer(t, 200, `{"plan":[]}`, 0), &recordingFallback{}, entries(), 0)
 	tr := entries()
 	st := turns.State{Busy: []string{"cleo", "ada"}}
 	got := r.UserPrompt(st, turns.Trigger{RoomID: room, FromUser: true}, tr.entries)
@@ -177,10 +203,14 @@ func TestUserPromptListsBusyBots(t *testing.T) {
 	}
 }
 
-func TestNextAgainstServer(t *testing.T) {
+func TestPlanAgainstServer(t *testing.T) {
 	afterAda := turns.State{BotTurns: 1, LastBot: "ada"}
-	adaSpoke := turns.Trigger{RoomID: room, Sender: "ada", Addressee: "cleo", Body: "A stakeout. Cleo, you coming."}
+	adaSpoke := turns.Trigger{RoomID: room, Sender: "ada", Addressees: []string{"cleo"}, Body: "A stakeout. Cleo, you coming."}
 	userSpoke := turns.Trigger{RoomID: room, FromUser: true, Body: "anyone around"}
+	plan := func(names ...string) string {
+		b, _ := json.Marshal(map[string]any{"addressed_to": "all", "user_question_pending": false, "plan": names})
+		return string(b)
+	}
 	tests := []struct {
 		name         string
 		status       int
@@ -188,42 +218,58 @@ func TestNextAgainstServer(t *testing.T) {
 		delay        time.Duration
 		st           turns.State
 		trig         turns.Trigger
-		want         string // "" = nobody
+		want         []string
 		wantRequests int32
 		wantFallback int32
 	}{
-		{"router picks a bot", 200, `{"next": "Cleo"}`, 0, afterAda, adaSpoke, "cleo", 1, 0},
-		{"display name in any case", 200, `{"next": "BRAM"}`, 0, afterAda, adaSpoke, "bram", 1, 0},
-		{"bot key accepted", 200, `{"next": "bram"}`, 0, afterAda, adaSpoke, "bram", 1, 0},
-		{"null is honoured even when a bot was named", 200, `{"next": null}`, 0, afterAda, adaSpoke, "", 1, 0},
-		{"unknown bot means null", 200, `{"next": "Dex"}`, 0, afterAda, adaSpoke, "", 1, 0},
-		{"the user is not a bot", 200, `{"next": "Alex"}`, 0, afterAda, adaSpoke, "", 1, 0},
-		{"last speaker is on cooldown", 200, `{"next": "Ada"}`, 0, afterAda, adaSpoke, "", 1, 0},
-		{"malformed output means null", 200, `I think Cleo.`, 0, afterAda, adaSpoke, "", 1, 0},
-		{"empty content means null", 200, ``, 0, afterAda, adaSpoke, "", 1, 0},
-		{"user message, no addressee: router picks", 200, `{"next": "Ada"}`, 0, turns.State{}, userSpoke, "ada", 1, 0},
-		{"HTTP 500 falls back to the rules", 500, ``, 0, afterAda, adaSpoke, "bram", 1, 1},
-		{"HTTP 400 (e.g. json mode rejected) falls back", 400, ``, 0, afterAda, adaSpoke, "bram", 1, 1},
-		{"timeout falls back to the rules", 200, `{"next": "Cleo"}`, 2 * time.Second, afterAda, adaSpoke, "bram", 1, 1},
-		{"cap reached: no call, nobody", 200, `{"next": "Cleo"}`, 0, turns.State{BotTurns: 2, LastBot: "ada"}, adaSpoke, "", 0, 0},
-		{"user names a bot: no call, it answers", 200, `{"next": null}`, 0, turns.State{}, turns.Trigger{RoomID: room, FromUser: true, Addressee: "cleo", Body: "Cleo?"}, "cleo", 0, 0},
-		{"bot asks the room a question: no call, nobody", 200, `{"next": "Cleo"}`, 0, afterAda, turns.Trigger{RoomID: room, Sender: "ada", Body: "What do you all think?"}, "", 0, 0},
-		{"bot asks the user by name: no call, nobody", 200, `{"next": "Cleo"}`, 0, afterAda, turns.Trigger{RoomID: room, Sender: "ada", Addressee: "cleo", Body: "Alex, should Cleo come too?"}, "", 0, 0},
-		{"bot asks another bot: router decides", 200, `{"next": "Cleo"}`, 0, afterAda, turns.Trigger{RoomID: room, Sender: "ada", Addressee: "cleo", Body: "Cleo, you coming?"}, "cleo", 1, 0},
-		{"busy pick means nobody", 200, `{"next": "Cleo"}`, 0, turns.State{BotTurns: 1, LastBot: "ada", Busy: []string{"cleo"}}, adaSpoke, "", 1, 0},
-		{"user names a busy bot: no shortcut, router decides", 200, `{"next": "Bram"}`, 0, turns.State{Busy: []string{"cleo"}}, turns.Trigger{RoomID: room, FromUser: true, Addressee: "cleo", Body: "Cleo?"}, "bram", 1, 0},
+		// Continuation (nobody owes the user): at most one bot.
+		{"router picks a bot", 200, plan("Cleo"), 0, afterAda, adaSpoke, []string{"cleo"}, 1, 0},
+		{"display name in any case", 200, plan("BRAM"), 0, afterAda, adaSpoke, []string{"bram"}, 1, 0},
+		{"only the first valid pick continues", 200, plan("Ada", "Dex", "Bram", "Cleo"), 0, afterAda, adaSpoke, []string{"bram"}, 1, 0},
+		{"empty plan is honoured even when a bot was named", 200, plan(), 0, afterAda, adaSpoke, nil, 1, 0},
+		{"the user is not a bot", 200, plan("Alex"), 0, afterAda, adaSpoke, nil, 1, 0},
+		{"last speaker is on cooldown", 200, plan("Ada"), 0, afterAda, adaSpoke, nil, 1, 0},
+		{"busy pick means nobody", 200, plan("Cleo"), 0, turns.State{BotTurns: 1, LastBot: "ada", Busy: []string{"cleo"}}, adaSpoke, nil, 1, 0},
+		{"a question that waits for the user stops continuation", 200, `{"addressed_to":"user","user_question_pending":true,"plan":["Cleo"]}`, 0, afterAda, adaSpoke, nil, 1, 0},
+		{"cap reached: no call, nobody", 200, plan("Cleo"), 0, turns.State{BotTurns: 2, LastBot: "ada"}, adaSpoke, nil, 0, 0},
+		{"malformed output between bots means nobody", 200, `I think Cleo.`, 0, afterAda, adaSpoke, nil, 1, 0},
+		{"old single-speaker shape between bots means nobody", 200, `{"next": "Cleo"}`, 0, afterAda, adaSpoke, nil, 1, 0},
+		{"malformed output for a user message falls back", 200, `I think Cleo.`, 0, turns.State{}, userSpoke, []string{"bram"}, 1, 1},
+		{"malformed output while bots are owed falls back", 200, `I think Cleo.`, 0, turns.State{LastBot: "ada", Owed: []string{"cleo", "bram"}}, adaSpoke, []string{"bram"}, 1, 1},
+		{"HTTP 500 falls back to the rules", 500, ``, 0, afterAda, adaSpoke, []string{"bram"}, 1, 1},
+		{"HTTP 400 (e.g. json mode rejected) falls back", 400, ``, 0, afterAda, adaSpoke, []string{"bram"}, 1, 1},
+		{"timeout falls back to the rules", 200, plan("Cleo"), 2 * time.Second, afterAda, adaSpoke, []string{"bram"}, 1, 1},
+
+		// User messages: everyone who owes a reply.
+		{"user message, no addressee: router plans", 200, `{"addressed_to":["Ada"],"user_question_pending":false,"plan":["Ada"]}`, 0, turns.State{}, userSpoke, []string{"ada"}, 1, 0},
+		{"user message to the group (model): every bot owes, plan order first", 200, `{"addressed_to":"all","user_question_pending":false,"plan":["Cleo"]}`, 0, turns.State{}, userSpoke, []string{"cleo", "ada", "bram"}, 1, 0},
+		{"user message to the group (words): every bot owes even if the model under-selects", 200, `{"addressed_to":["Ada"],"user_question_pending":false,"plan":["Ada"]}`, 0, turns.State{},
+			turns.Trigger{RoomID: room, FromUser: true, Group: true, Body: "你们觉得呢?"}, []string{"ada", "cleo", "bram"}, 1, 0},
+		{"user message needing no reply", 200, `{"addressed_to":"none","user_question_pending":false,"plan":[]}`, 0, turns.State{}, userSpoke, nil, 1, 0},
+		{"user names bots: no call, all of them answer", 200, plan(), 0, turns.State{},
+			turns.Trigger{RoomID: room, FromUser: true, Addressees: []string{"cleo", "ada"}, Body: "Cleo, Ada?"}, []string{"cleo", "ada"}, 0, 0},
+		{"user names a busy bot: router plans the rest", 200, `{"addressed_to":["Bram"],"user_question_pending":false,"plan":["Bram"]}`, 0, turns.State{Busy: []string{"cleo"}},
+			turns.Trigger{RoomID: room, FromUser: true, Addressees: []string{"cleo"}, Body: "Cleo?"}, []string{"bram"}, 1, 0},
+		{"busy bots never owe", 200, `{"addressed_to":"all","user_question_pending":false,"plan":["Cleo","Ada"]}`, 0, turns.State{Busy: []string{"cleo"}}, userSpoke, []string{"ada", "bram"}, 1, 0},
+
+		// Bots still owe the user: the model only orders them.
+		{"one owed bot speaks, no call", 200, plan("Cleo"), 0, turns.State{LastBot: "ada", Owed: []string{"bram"}}, adaSpoke, []string{"bram"}, 0, 0},
+		{"several owed: the model orders them", 200, plan("Bram", "Cleo"), 0, turns.State{LastBot: "ada", Owed: []string{"cleo", "bram"}}, adaSpoke, []string{"bram", "cleo"}, 1, 0},
+		{"several owed: a question in passing doesn't drop them", 200, `{"addressed_to":"user","user_question_pending":true,"plan":[]}`, 0,
+			turns.State{LastBot: "ada", Owed: []string{"cleo", "bram"}}, turns.Trigger{RoomID: room, Sender: "ada", Body: "Blue. Alex, did you buy paint?"}, nil, 1, 0},
+		{"owed bots are served past the cap", 200, plan("Bram"), 0, turns.State{BotTurns: 5, LastBot: "ada", Owed: []string{"cleo", "bram"}}, adaSpoke, []string{"bram"}, 1, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := newServer(t, tt.status, tt.content, tt.delay)
-			fb := &recordingFallback{next: "bram"}
+			fb := &recordingFallback{plan: []string{"bram"}}
 			r := newRouter(s, fb, entries(), 200*time.Millisecond)
-			got, ok, err := r.Next(context.Background(), tt.st, tt.trig)
+			got, err := r.Plan(context.Background(), tt.st, tt.trig)
 			if err != nil {
 				t.Fatalf("router returned an error: %v", err)
 			}
-			if (tt.want == "") == ok || got != tt.want {
-				t.Fatalf("got %q ok=%v, want %q", got, ok, tt.want)
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
 			}
 			if n := s.requests.Load(); n != tt.wantRequests {
 				t.Errorf("router made %d requests, want %d", n, tt.wantRequests)
@@ -236,10 +282,10 @@ func TestNextAgainstServer(t *testing.T) {
 }
 
 func TestRequestShape(t *testing.T) {
-	s := newServer(t, 200, `{"next": null}`, 0)
+	s := newServer(t, 200, `{"plan": []}`, 0)
 	tr := entries()
 	r := newRouter(s, &recordingFallback{}, tr, time.Second)
-	if _, _, err := r.Next(context.Background(), turns.State{}, turns.Trigger{RoomID: room, FromUser: true, Body: "hi"}); err != nil {
+	if _, err := r.Plan(context.Background(), turns.State{}, turns.Trigger{RoomID: room, FromUser: true, Body: "hi"}); err != nil {
 		t.Fatal(err)
 	}
 	if tr.limit != 3 {
@@ -268,14 +314,45 @@ func TestRequestShape(t *testing.T) {
 
 	// json_mode off: no response_format at all.
 	r.o.JSONMode = false
-	r.Next(context.Background(), turns.State{}, turns.Trigger{RoomID: room, FromUser: true, Body: "hi"})
+	r.Plan(context.Background(), turns.State{}, turns.Trigger{RoomID: room, FromUser: true, Body: "hi"})
 	if strings.Contains(string(s.lastBody.Load().([]byte)), "response_format") {
 		t.Error("response_format sent with json_mode off")
 	}
 }
 
-// The cap holds with the router on even if the model always picks someone,
-// and the real turns.Rules fallback (router down) also respects it.
+// Every model call is logged as one JSON line: input, output, model,
+// latency and the tokens the endpoint reports.
+func TestCallLog(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"{\"plan\": [\"Cleo\"]}"}}],`+
+			`"usage":{"prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"completion_tokens_details":{"reasoning_tokens":12}}}`)
+	}))
+	defer srv.Close()
+	var buf bytes.Buffer
+	r := New(Options{
+		BaseURL: srv.URL + "/v1", APIKey: "rk", Model: "flash", Window: 5,
+		Transcript: entries(), Roster: testRoster, MaxBotTurns: 2, Fallback: &recordingFallback{}, CallLog: &buf,
+	})
+	r.Plan(context.Background(), turns.State{}, turns.Trigger{RoomID: room, FromUser: true, Body: "hi"})
+	var rec CallRecord
+	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+		t.Fatalf("log line %q: %v", buf.String(), err)
+	}
+	if rec.Model != "flash" || !rec.FromUser || rec.Room != room || !strings.Contains(rec.Input, "Recent messages") ||
+		rec.Output != `{"plan": ["Cleo"]}` || !slices.Equal(rec.ParsedPlan, []string{"Cleo"}) || rec.System == "" {
+		t.Fatalf("record %+v", rec)
+	}
+	if rec.Usage == nil || rec.Usage.TotalTokens != 150 || rec.Usage.Details == nil || rec.Usage.Details.ReasoningTokens != 12 {
+		t.Fatalf("usage %+v", rec.Usage)
+	}
+	if strings.Count(buf.String(), "\n") != 1 {
+		t.Fatalf("want exactly one line, got %q", buf.String())
+	}
+}
+
+// The bot-to-bot cap holds with the router on even if the model always
+// picks someone, and the real turns.Rules fallback (router down) also
+// respects it.
 func TestCapEnforcedWithRouterOn(t *testing.T) {
 	bots := []string{"ada", "cleo", "bram"}
 	for _, down := range []bool{false, true} {
@@ -291,7 +368,7 @@ func TestCapEnforcedWithRouterOn(t *testing.T) {
 			if strings.Contains(string(body), "from Cleo, who just spoke") {
 				pick = "Ada"
 			}
-			io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"{\"next\": \"`+pick+`\"}"}}]}`)
+			io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"{\"plan\": [\"`+pick+`\"]}"}}]}`)
 		}))
 		defer srv.Close()
 		r := New(Options{
@@ -299,17 +376,17 @@ func TestCapEnforcedWithRouterOn(t *testing.T) {
 			Transcript: entries(), Roster: testRoster, MaxBotTurns: 2,
 			Fallback: turns.NewRules(bots, 2, rand.New(rand.NewPCG(1, 1))),
 		})
-		st := turns.State{}
-		trig := turns.Trigger{RoomID: room, FromUser: true, Body: "go on"}
+		st := turns.State{LastBot: "ada"} // ada just answered the user
+		trig := turns.Trigger{RoomID: room, Sender: "ada", Body: "And another thing."}
 		spoke := 0
 		for range 10 {
-			next, ok, _ := r.Next(context.Background(), st, trig)
-			if !ok {
+			plan, _ := r.Plan(context.Background(), st, trig)
+			if len(plan) == 0 {
 				break
 			}
 			spoke++
-			st.BotSpoke(next)
-			trig = turns.Trigger{RoomID: room, Sender: next, Body: "And another thing."}
+			st.BotSpoke(plan[0], true)
+			trig = turns.Trigger{RoomID: room, Sender: plan[0], Body: "And another thing."}
 		}
 		if spoke != 2 || requests.Load() != 2 {
 			t.Fatalf("router down=%v: %d bot turns and %d requests, want 2 and 2", down, spoke, requests.Load())
@@ -317,17 +394,10 @@ func TestCapEnforcedWithRouterOn(t *testing.T) {
 	}
 }
 
-func TestParseAnswerReason(t *testing.T) {
-	ans, err := ParseAnswer(`{"next": null, "reason": " Alex was asked "}`)
-	if err != nil || ans.Next != "" || ans.Reason != "Alex was asked" {
-		t.Fatalf("got %+v, %v", ans, err)
-	}
-}
-
 // One character answering again and again shows up in the counts the
 // router sees, along with who has been quiet.
 func TestParticipationCounts(t *testing.T) {
-	r := newRouter(newServer(t, 200, `{"next":null}`, 0), &recordingFallback{}, entries(), 0)
+	r := newRouter(newServer(t, 200, `{"plan":[]}`, 0), &recordingFallback{}, entries(), 0)
 	var es []transcript.Entry
 	for range 3 {
 		es = append(es, transcript.Entry{Sender: "@alex:z", Body: "hm"}, transcript.Entry{Sender: "@ada:z", Body: "yes"})
@@ -336,25 +406,5 @@ func TestParticipationCounts(t *testing.T) {
 	got := r.participation(es)
 	if want := "Messages per character above: Ada 3, Cleo 1.\nNot heard from above: Bram.\n"; got != want {
 		t.Fatalf("participation = %q, want %q", got, want)
-	}
-}
-
-func TestQuestionToUser(t *testing.T) {
-	tests := []struct {
-		body, addressee string
-		want            bool
-	}{
-		{"Nice weather.", "", false},
-		{"What do you think?", "", true},
-		{"Alex, what do you think?", "", true},
-		{"Cleo, what do you think?", "cleo", false},
-		{"Alex, should Cleo come?", "cleo", true},
-		{"Cleo, should we ask Alex?", "cleo", false},
-		{"Cleo is right. Thoughts?", "cleo", false},
-	}
-	for _, tt := range tests {
-		if got := QuestionToUser(testRoster, tt.body, tt.addressee); got != tt.want {
-			t.Errorf("QuestionToUser(%q, %q) = %v, want %v", tt.body, tt.addressee, got, tt.want)
-		}
 	}
 }

@@ -20,11 +20,11 @@ type spyDecider struct {
 	busy  [][]string
 }
 
-func (d *spyDecider) Next(ctx context.Context, st turns.State, t turns.Trigger) (string, bool, error) {
+func (d *spyDecider) Plan(ctx context.Context, st turns.State, t turns.Trigger) ([]string, error) {
 	d.mu.Lock()
 	d.busy = append(d.busy, append([]string(nil), st.Busy...))
 	d.mu.Unlock()
-	return d.inner.Next(ctx, st, t)
+	return d.inner.Plan(ctx, st, t)
 }
 
 func (h *harness) snap() (posts, notices, reacts, typing []string, calls []call) {
@@ -95,7 +95,7 @@ func startBusyAda(t *testing.T, h *harness) string {
 }
 
 func TestQuickRunStaysSynchronous(t *testing.T) {
-	h := newHarnessWith(t, harnessOpts{maxTurns: 1, backgroundAfter: time.Second}, func(bot string, n int) string { return "hi from " + bot })
+	h := newHarnessWith(t, harnessOpts{maxTurns: 0, backgroundAfter: time.Second}, func(bot string, n int) string { return "hi from " + bot })
 	h.runOne("Ada, hello")
 	posts, notices, _, typing, _ := h.snap()
 	if !slices.Equal(posts, []string{"ada: hi from ada"}) {
@@ -115,7 +115,7 @@ func TestQuickRunStaysSynchronous(t *testing.T) {
 
 func TestTypingIsRefreshedWhileARunGoes(t *testing.T) {
 	release := make(chan struct{})
-	h := newHarnessWith(t, harnessOpts{maxTurns: 1, typingEvery: 5 * time.Millisecond}, func(bot string, n int) string {
+	h := newHarnessWith(t, harnessOpts{maxTurns: 0, typingEvery: 5 * time.Millisecond}, func(bot string, n int) string {
 		<-release
 		return "done"
 	})
@@ -139,7 +139,7 @@ func TestTypingIsRefreshedWhileARunGoes(t *testing.T) {
 func TestSlowRunIsBackgroundedAndRepliesLater(t *testing.T) {
 	release := make(chan struct{})
 	spy := &spyDecider{}
-	h := newHarnessWith(t, harnessOpts{maxTurns: 2, backgroundAfter: 20 * time.Millisecond, decider: func(bots []string) turns.Decider {
+	h := newHarnessWith(t, harnessOpts{maxTurns: 1, backgroundAfter: 20 * time.Millisecond, decider: func(bots []string) turns.Decider {
 		spy.inner = turns.NewRules(bots, 2, rand.New(rand.NewPCG(1, 1)))
 		return spy
 	}}, slowAda(release))
@@ -206,7 +206,7 @@ func TestSteerBusyBot(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			release := make(chan struct{})
-			h := newHarnessWith(t, harnessOpts{maxTurns: 1, backgroundAfter: 20 * time.Millisecond}, slowAda(release))
+			h := newHarnessWith(t, harnessOpts{maxTurns: 0, backgroundAfter: 20 * time.Millisecond}, slowAda(release))
 			h.keepSteers = tt.keepSteers
 			h.srv.SteerStatus = tt.refuse
 			startBusyAda(t, h)
@@ -249,7 +249,7 @@ func TestSteerBusyBot(t *testing.T) {
 // it reaches her on her next turn.
 func TestMessagesToOthersAreNotSteered(t *testing.T) {
 	release := make(chan struct{})
-	h := newHarnessWith(t, harnessOpts{maxTurns: 1, backgroundAfter: 20 * time.Millisecond}, slowAda(release))
+	h := newHarnessWith(t, harnessOpts{maxTurns: 0, backgroundAfter: 20 * time.Millisecond}, slowAda(release))
 	startBusyAda(t, h)
 	h.o.Handle(h.ctx, h.user("Cleo, what do you think?"))
 	h.waitPosts(1)
@@ -281,7 +281,7 @@ func TestBackgroundFailureAndTimeout(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			release := make(chan struct{})
 			var once sync.Once
-			h := newHarnessWith(t, harnessOpts{maxTurns: 1, backgroundAfter: 20 * time.Millisecond, runTimeout: tt.runTimeout},
+			h := newHarnessWith(t, harnessOpts{maxTurns: 0, backgroundAfter: 20 * time.Millisecond, runTimeout: tt.runTimeout},
 				func(bot string, n int) string {
 					first := false
 					once.Do(func() { first = true })
@@ -315,7 +315,7 @@ func TestBackgroundFailureAndTimeout(t *testing.T) {
 
 func TestResetWhileBusyStillPostsResult(t *testing.T) {
 	release := make(chan struct{})
-	h := newHarnessWith(t, harnessOpts{maxTurns: 1, backgroundAfter: 20 * time.Millisecond}, slowAda(release))
+	h := newHarnessWith(t, harnessOpts{maxTurns: 0, backgroundAfter: 20 * time.Millisecond}, slowAda(release))
 	reqID := startBusyAda(t, h)
 	h.o.Handle(h.ctx, h.user("!reset"))
 	h.waitNotices(2)
@@ -336,7 +336,7 @@ func TestResetWhileBusyStillPostsResult(t *testing.T) {
 
 func TestExplainBusyBot(t *testing.T) {
 	release := make(chan struct{})
-	h := newHarnessWith(t, harnessOpts{maxTurns: 1, backgroundAfter: 20 * time.Millisecond}, slowAda(release))
+	h := newHarnessWith(t, harnessOpts{maxTurns: 0, backgroundAfter: 20 * time.Millisecond}, slowAda(release))
 	startBusyAda(t, h)
 	h.o.Handle(h.ctx, h.user("!explain Ada"))
 	if ns := h.waitNotices(2); ns[1] != "ada: Ada is busy with a task; try !explain again when it has answered." {
@@ -369,7 +369,7 @@ func TestBusyIsPerRoom(t *testing.T) {
 }
 
 func TestShutdownWithRunInFlightDoesNotHang(t *testing.T) {
-	h := newHarnessWith(t, harnessOpts{maxTurns: 1, backgroundAfter: 20 * time.Millisecond}, func(string, int) string { return "HANG" })
+	h := newHarnessWith(t, harnessOpts{maxTurns: 0, backgroundAfter: 20 * time.Millisecond}, func(string, int) string { return "HANG" })
 	ctx, cancel := context.WithCancel(h.ctx)
 	done := make(chan struct{})
 	go func() { h.o.Run(ctx); close(done) }()
@@ -392,7 +392,7 @@ func TestSteerConsumedRightAsRunEnds(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		var h *harness
 		var once sync.Once
-		h = newHarnessWith(t, harnessOpts{maxTurns: 1, backgroundAfter: 20 * time.Millisecond}, func(bot string, n int) string {
+		h = newHarnessWith(t, harnessOpts{maxTurns: 0, backgroundAfter: 20 * time.Millisecond}, func(bot string, n int) string {
 			first := false
 			once.Do(func() { first = true })
 			if !first {
@@ -416,7 +416,7 @@ func TestSteerConsumedRightAsRunEnds(t *testing.T) {
 // Polling errors (Hermes draining: 503) are retried; the run's result
 // still posts, with no failure notice.
 func TestTransientPollErrorsAreRetried(t *testing.T) {
-	h := newHarnessWith(t, harnessOpts{maxTurns: 1}, func(bot string, n int) string { return "fine" })
+	h := newHarnessWith(t, harnessOpts{maxTurns: 0}, func(bot string, n int) string { return "fine" })
 	h.srv.StatusFailures = 3
 	h.runOne("Ada?")
 	posts, notices, _, _, _ := h.snap()
@@ -443,7 +443,7 @@ func TestPartialRunIsPosted(t *testing.T) {
 			if tt.backgroundAfter > 0 {
 				release = make(chan struct{})
 			}
-			h := newHarnessWith(t, harnessOpts{maxTurns: 1, backgroundAfter: tt.backgroundAfter}, func(bot string, n int) string {
+			h := newHarnessWith(t, harnessOpts{maxTurns: 0, backgroundAfter: tt.backgroundAfter}, func(bot string, n int) string {
 				if n == 1 {
 					<-release
 					return "PARTIAL:got halfway"
@@ -477,7 +477,7 @@ func TestPartialRunIsPosted(t *testing.T) {
 // input (not in the transcript); once she is done the status is gone.
 func TestOthersSeeBusyStatus(t *testing.T) {
 	release := make(chan struct{})
-	h := newHarnessWith(t, harnessOpts{maxTurns: 2, backgroundAfter: 20 * time.Millisecond}, slowAda(release))
+	h := newHarnessWith(t, harnessOpts{maxTurns: 1, backgroundAfter: 20 * time.Millisecond}, slowAda(release))
 	startBusyAda(t, h)
 	status := `Ada is working on a task in the background, started by Alex's message "Ada, draw a cat in Canva". ` +
 		`Ada's result will be posted when it is done; don't do that task yourself or answer for Ada.`

@@ -36,7 +36,7 @@ const memBlock = "Recollections from past group chats. They may be wrong or out 
 	"<memory source=\"past group chats\">\n- Alex said they prefer tea.\n</memory>"
 
 func TestMemoryBlockGoesIntoUserMessageOnly(t *testing.T) {
-	h := newHarness(t, 2, func(bot string, n int) string { return "reply " + bot })
+	h := newHarness(t, 1, func(bot string, n int) string { return "reply " + bot })
 	mem := &fakeMemory{block: memBlock}
 	h.o.rooms[roomID].memory = mem
 	h.runOne("Cleo, tea or coffee?")
@@ -69,7 +69,7 @@ func TestMemoryBlockGoesIntoUserMessageOnly(t *testing.T) {
 }
 
 func TestNoMemoryBlockWhenNothingRecalled(t *testing.T) {
-	h := newHarness(t, 1, func(bot string, n int) string { return "reply" })
+	h := newHarness(t, 0, func(bot string, n int) string { return "reply" })
 	h.o.rooms[roomID].memory = &fakeMemory{}
 	h.runOne("Cleo, hi")
 	if raw := h.calls[0].raw; strings.Contains(raw, "memory") || !strings.HasPrefix(raw, "New messages in the group chat") {
@@ -84,7 +84,7 @@ func TestMemoryOffFrameUnchanged(t *testing.T) {
 }
 
 func TestResetRecordsSegmentBreak(t *testing.T) {
-	h := newHarness(t, 2, func(bot string, n int) string { return "reply " + bot })
+	h := newHarness(t, 1, func(bot string, n int) string { return "reply " + bot })
 	h.runOne("Cleo, hello")
 	upTo := h.latestSeq()
 	h.runCmd(h.user("!reset"))
@@ -96,7 +96,7 @@ func TestResetRecordsSegmentBreak(t *testing.T) {
 
 func TestMemoryDeliveredOnlyAfterSuccessfulCall(t *testing.T) {
 	fail := true
-	h := newHarness(t, 1, func(bot string, n int) string {
+	h := newHarness(t, 0, func(bot string, n int) string {
 		if fail {
 			return "ERR"
 		}

@@ -20,7 +20,8 @@ rooms:                                   # room IDs from Room settings → Advan
   #     recall: { enabled: true }
   #     retain: { enabled: true, idle_minutes: 30, min_messages: 4 }
 
-max_bot_turns: 4        # consecutive bot replies after a user message, then wait for the user
+max_bot_turns: 2        # bot-to-bot replies after the bots owed the user have answered, then wait for the user
+# group_words: [你们, 大家, 各位, everyone, everybody, all of you, you all, "y'all", you guys]   # address every bot at once; [] = off
 max_delta_lines: 40     # most transcript lines sent to a bot in one call (caps a bot's first call)
 msgtype: m.text         # or m.notice (clients render notices as bot output, no notifications)
 state_db: ./roomd.db    # SQLite: transcript, cursors, session generations (relative to this file)
@@ -69,10 +70,11 @@ bots:
 
 # LLM turn router (optional). With enabled: false, or with this
 # block left out, roomd uses the deterministic turn rules only.
-# When enabled, a separate cheap model picks who speaks next as
-# {"next": "<name>"} or {"next": null}; null (wait for the user) is the default.
-# max_bot_turns stays a hard ceiling, and if a router call fails or times out
-# the turn rules decide that turn.
+# When enabled, a separate cheap model answers with a response plan:
+# {"addressed_to": [...] | "all" | "user" | "none", "user_question_pending": bool, "plan": [...]}.
+# Code keeps the rules: named bots and group_words always get their replies,
+# max_bot_turns caps bot-to-bot replies, and if a router call fails or times
+# out the turn rules decide that turn.
 router:
   enabled: false
   base_url: https://api.venice.ai/api/v1   # OpenAI-style base INCLUDING /v1 (unlike hermes.base_url); roomd appends /chat/completions
@@ -81,6 +83,7 @@ router:
   timeout: 15s                             # per router call; on timeout the turn rules decide
   window: 12                               # recent messages the router sees
   json_mode: true                          # sends response_format json_object; set false if the endpoint rejects it
+  # log_file: ./router-calls.jsonl         # one JSON line per router call (input, output, latency, tokens), for evals
 
 # Shared memory of past group chats (optional). A Hindsight bank that
 # ONLY roomd reads and writes; the bots never write to it, and it is separate

@@ -3,9 +3,12 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ziliding/hermes-roomd/internal/roster"
 )
 
 const good = `
@@ -251,5 +254,47 @@ func TestMemoryConfigValidation(t *testing.T) {
 				t.Fatalf("err %v, want it to mention %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// group_words: absent means the defaults, [] turns group address off, and a
+// list replaces the defaults.
+func TestGroupWords(t *testing.T) {
+	tests := []struct {
+		yaml string
+		want []string
+	}{
+		{"", roster.DefaultGroupWords},
+		{"group_words: []\n", []string{}},
+		{"group_words: [你们, folks]\n", []string{"你们", "folks"}},
+	}
+	for _, tt := range tests {
+		c, err := Parse([]byte(good+tt.yaml), env(allEnv))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(c.GroupWords, tt.want) || c.GroupWords == nil {
+			t.Errorf("%q: group words %v, want %v", tt.yaml, c.GroupWords, tt.want)
+		}
+	}
+}
+
+// router.log_file resolves against the config file's folder.
+func TestRouterLogFileIsRelativeToConfig(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "rules.md"), []byte("rules"), 0o600)
+	y := good + "group_rules_file: rules.md\nrouter: { enabled: true, base_url: http://x/v1, model: m, key_env: RK, log_file: calls.jsonl }\n"
+	path := filepath.Join(dir, "roomd.yaml")
+	os.WriteFile(path, []byte(y), 0o600)
+	for k, v := range allEnv {
+		t.Setenv(k, v)
+	}
+	t.Setenv("RK", "rk")
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Router.LogFile != filepath.Join(dir, "calls.jsonl") {
+		t.Fatalf("log_file %q", c.Router.LogFile)
 	}
 }

@@ -43,7 +43,7 @@ func dataURL(data []byte) string {
 }
 
 func TestPostedImageReachesEachBotOnce(t *testing.T) {
-	h := newHarness(t, 2, func(bot string, n int) string { return "nice, from " + bot })
+	h := newHarness(t, 1, func(bot string, n int) string { return "nice, from " + bot })
 	pic := testPNG(t)
 	h.media = map[string][]byte{"mxc://example.com/cat": pic}
 	h.runMsg(h.userImage("cat.png", "Ada, what is this?", "mxc://example.com/cat"))
@@ -75,7 +75,7 @@ func TestPostedImageReachesEachBotOnce(t *testing.T) {
 }
 
 func TestImageWithoutCaptionIsNotACommand(t *testing.T) {
-	h := newHarness(t, 1, func(bot string, n int) string { return "ok" })
+	h := newHarness(t, 0, func(bot string, n int) string { return "ok" })
 	h.media = map[string][]byte{"mxc://example.com/r": testPNG(t)}
 	m := h.user("")
 	m.Image = &matrixio.ImageRef{URL: "mxc://example.com/r", Name: "/reset"} // a file named like a command
@@ -86,7 +86,7 @@ func TestImageWithoutCaptionIsNotACommand(t *testing.T) {
 }
 
 func TestUnusableImagesBecomeNotes(t *testing.T) {
-	h := newHarness(t, 1, func(bot string, n int) string { return "ok" })
+	h := newHarness(t, 0, func(bot string, n int) string { return "ok" })
 	pic := testPNG(t)
 	h.media = map[string][]byte{
 		"mxc://example.com/text": []byte("just some text, not an image"),
@@ -115,7 +115,7 @@ func TestUnusableImagesBecomeNotes(t *testing.T) {
 }
 
 func TestAtMostFourImagesPerTurn(t *testing.T) {
-	h := newHarness(t, 1, func(bot string, n int) string { return "ok" })
+	h := newHarness(t, 0, func(bot string, n int) string { return "ok" })
 	pic := testPNG(t)
 	h.media = map[string][]byte{"mxc://example.com/p": pic}
 	w := h.o.rooms[roomID]
@@ -137,7 +137,7 @@ func TestAtMostFourImagesPerTurn(t *testing.T) {
 // only): it reaches the bot, image attached, on its next turn.
 func TestImageForBusyBotWaitsForItsNextTurn(t *testing.T) {
 	release := make(chan struct{})
-	h := newHarnessWith(t, harnessOpts{maxTurns: 1, backgroundAfter: 20 * time.Millisecond}, slowAda(release))
+	h := newHarnessWith(t, harnessOpts{maxTurns: 0, backgroundAfter: 20 * time.Millisecond}, slowAda(release))
 	pic := testPNG(t)
 	h.media = map[string][]byte{"mxc://example.com/cat": pic}
 	startBusyAda(t, h)
@@ -162,7 +162,7 @@ func TestImageForBusyBotWaitsForItsNextTurn(t *testing.T) {
 // Hermes refusing a run with images (413: body too large) doesn't cost the
 // turn: roomd starts it again without them, and never retries them.
 func TestRejectedImagesAreDropped(t *testing.T) {
-	h := newHarness(t, 1, func(bot string, n int) string { return "ok" })
+	h := newHarness(t, 0, func(bot string, n int) string { return "ok" })
 	h.media = map[string][]byte{"mxc://example.com/cat": testPNG(t)}
 	h.srv.StartStatus = func(n int) int {
 		if n == 1 {
@@ -182,7 +182,7 @@ func TestRejectedImagesAreDropped(t *testing.T) {
 // A run that fails while carrying images is retried on the next turn
 // without them, so one image the model rejects can't jam the bot.
 func TestFailedRunWithImagesRetriesWithoutThem(t *testing.T) {
-	h := newHarness(t, 1, func(bot string, n int) string {
+	h := newHarness(t, 0, func(bot string, n int) string {
 		if n == 1 {
 			return "ERR"
 		}

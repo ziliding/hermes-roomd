@@ -6,6 +6,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand/v2"
 	"os"
@@ -105,7 +106,16 @@ func run(ctx context.Context, cfgPath string, log *slog.Logger) error {
 	for _, k := range keys {
 		posters[k], runners[k] = senders[k], hermesFor[k]
 	}
-	specs, retainers := buildRooms(cfg, store, posters, runners, uint64(time.Now().UnixNano()), log)
+	var routerLog io.Writer
+	if cfg.Router.Enabled && cfg.Router.LogFile != "" {
+		f, err := os.OpenFile(cfg.Router.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			return fmt.Errorf("router.log_file: %w", err)
+		}
+		defer f.Close()
+		routerLog = f
+	}
+	specs, retainers := buildRooms(cfg, store, posters, runners, routerLog, uint64(time.Now().UnixNano()), log)
 	orch := room.New(room.Options{Store: store, RoomSpecs: specs, MaxDeltaLines: cfg.MaxDeltaLines, Log: log, RunTimeout: cfg.HermesTimeout, Files: files})
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -155,7 +165,7 @@ func run(ctx context.Context, cfgPath string, log *slog.Logger) error {
 // rules rendered per bot, a decider over that cast with the room's
 // max_bot_turns, and recall/retain against the room's own bank.
 func buildRooms(cfg *config.Config, store *transcript.Store, posters map[string]room.Poster, runners map[string]room.Runner,
-	seed uint64, log *slog.Logger) ([]room.RoomSpec, []*memory.Retainer) {
+	routerLog io.Writer, seed uint64, log *slog.Logger) ([]room.RoomSpec, []*memory.Retainer) {
 	blurbs := map[string]string{}
 	for k, b := range cfg.Bots {
 		blurbs[k] = b.Blurb
@@ -184,10 +194,11 @@ func buildRooms(cfg *config.Config, store *transcript.Store, posters map[string]
 				BaseURL: c.BaseURL, APIKey: c.Key, Model: c.Model, Timeout: c.Timeout, Window: c.Window, JSONMode: *c.JSONMode,
 				Transcript: store, Roster: r, Blurbs: blurbs, MaxBotTurns: rc.MaxBotTurns,
 				Fallback: decider, // the turn rules decide whenever the router call fails
-				Log:      log,
+				Log:      log, CallLog: routerLog,
 			})
 		}
-		spec := room.RoomSpec{ID: rc.ID, Roster: r, Decider: decider, Bots: bots, Notifier: rc.Listener,
+		spec := room.RoomSpec{ID: rc.ID, Roster: r, Decider: decider, Group: roster.NewGroupMatcher(cfg.GroupWords),
+			Bots: bots, Notifier: rc.Listener,
 			BackgroundAfter: time.Duration(*rc.BackgroundAfter)}
 
 		if mc := cfg.Memory; mc.Enabled {

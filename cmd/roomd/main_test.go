@@ -92,7 +92,7 @@ func TestBuildRoomsPerRoomCastAndBank(t *testing.T) {
 	for _, k := range cfg.BotKeys() {
 		posters[k], runners[k] = nopPoster{}, hermes.New("http://h/p/"+k, "k", "")
 	}
-	specs, retainers := buildRooms(cfg, store, posters, runners, 1, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	specs, retainers := buildRooms(cfg, store, posters, runners, nil, 1, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	if len(specs) != 2 || len(retainers) != 2 {
 		t.Fatalf("specs %d retainers %d", len(specs), len(retainers))

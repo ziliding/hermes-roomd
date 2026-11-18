@@ -21,7 +21,7 @@ func inline(data string) string {
 
 func TestReplyWithImagesPostsMImagesInOrder(t *testing.T) {
 	reply := "Here it is:\n\n" + inline(fakePNG) + "\n\nLike it?\nMEDIA:/home/bot/.hermes/out/notes.pdf"
-	h := newHarness(t, 2, func(bot string, n int) string {
+	h := newHarness(t, 1, func(bot string, n int) string {
 		if bot == "ada" {
 			return reply
 		}
@@ -53,7 +53,7 @@ func TestReplyWithImagesPostsMImagesInOrder(t *testing.T) {
 
 func TestBackgroundImageReplyRelationOnFirstEventOnly(t *testing.T) {
 	release := make(chan struct{})
-	h := newHarnessWith(t, harnessOpts{maxTurns: 1, backgroundAfter: 20 * time.Millisecond}, func(bot string, n int) string {
+	h := newHarnessWith(t, harnessOpts{maxTurns: 0, backgroundAfter: 20 * time.Millisecond}, func(bot string, n int) string {
 		<-release
 		return inline(fakePNG) + "\nDone: a cat."
 	})
@@ -66,7 +66,7 @@ func TestBackgroundImageReplyRelationOnFirstEventOnly(t *testing.T) {
 }
 
 func TestImageUploadFailureStillPostsTheText(t *testing.T) {
-	h := newHarness(t, 1, func(bot string, n int) string { return "Your cat:\n" + inline(fakePNG) })
+	h := newHarness(t, 0, func(bot string, n int) string { return "Your cat:\n" + inline(fakePNG) })
 	h.imageFail = true
 	h.runOne("Ada, draw a cat")
 	posts, _, _, _, _ := h.snap()
@@ -77,7 +77,7 @@ func TestImageUploadFailureStillPostsTheText(t *testing.T) {
 
 func TestOversizedTextIsSplit(t *testing.T) {
 	long := strings.Repeat(strings.Repeat("word ", 200)+"\n\n", 80) // ~80 KB
-	h := newHarness(t, 1, func(bot string, n int) string { return long })
+	h := newHarness(t, 0, func(bot string, n int) string { return long })
 	h.runOne("Ada, write a lot")
 	posts, _, _, _, _ := h.snap()
 	if len(posts) < 3 {
@@ -121,7 +121,7 @@ func TestReplyNamingAnImageFile(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := newHarnessWith(t, harnessOpts{maxTurns: 1, files: files}, func(string, int) string { return tt.reply })
+			h := newHarnessWith(t, harnessOpts{maxTurns: 0, files: files}, func(string, int) string { return tt.reply })
 			h.runOne("Ada, draw a cat")
 			posts, _, _, _, _ := h.snap()
 			if !slices.Equal(posts, tt.want) {

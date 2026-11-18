@@ -25,8 +25,8 @@ var allPeople = map[string]roster.Person{
 }
 
 // newRoomsHarness has two rooms with different casts and settings:
-//   - roomID ("lounge"): ada + cleo, listener cleo, max 3 bot turns;
-//   - roomB ("library"): ada + bram, listener bram, max 1 bot turn.
+//   - roomID ("lounge"): ada + cleo, listener cleo, one reply + 2 bot-to-bot turns;
+//   - roomB ("library"): ada + bram, listener bram, one reply, no bot-to-bot turns.
 func newRoomsHarness(t *testing.T) *harness {
 	t.Helper()
 	store, err := transcript.Open(context.Background(), ":memory:")
@@ -51,8 +51,8 @@ func newRoomsHarness(t *testing.T) *harness {
 	h.o = New(Options{
 		Store: store, MaxDeltaLines: 40, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), PollInterval: 2 * time.Millisecond,
 		RoomSpecs: []RoomSpec{
-			spec(roomID, "LOUNGE", []string{"ada", "cleo"}, "cleo", 3),
-			spec(roomB, "LIBRARY", []string{"ada", "bram"}, "bram", 1),
+			spec(roomID, "LOUNGE", []string{"ada", "cleo"}, "cleo", 2),
+			spec(roomB, "LIBRARY", []string{"ada", "bram"}, "bram", 0),
 		},
 	})
 	return h

@@ -214,7 +214,7 @@ func newHarnessWith(t *testing.T, ho harnessOpts, reply func(bot string, n int) 
 		decider = ho.decider([]string{"ada", "cleo"})
 	}
 	h.o = New(Options{
-		Store: store, Roster: r, Decider: decider,
+		Store: store, Roster: r, Decider: decider, Group: roster.NewGroupMatcher(roster.DefaultGroupWords),
 		Bots: bots, Rooms: []string{roomID}, MaxDeltaLines: 40,
 		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 		PollInterval: 2 * time.Millisecond, RunTimeout: ho.runTimeout,
@@ -242,7 +242,7 @@ func (h *harness) runOne(body string) matrixio.Message {
 }
 
 func TestChainNamedBotThenOtherThenStop(t *testing.T) {
-	h := newHarness(t, 2, func(bot string, n int) string { return "reply from " + bot })
+	h := newHarness(t, 1, func(bot string, n int) string { return "reply from " + bot })
 	h.runOne("@Cleo what's up?")
 	if want := []string{"cleo: reply from cleo", "ada: reply from ada"}; strings.Join(h.posts, "|") != strings.Join(want, "|") {
 		t.Fatalf("posts %v, want %v", h.posts, want)
@@ -268,7 +268,7 @@ func TestChainNamedBotThenOtherThenStop(t *testing.T) {
 }
 
 func TestSilentReplyIsNotATurnButAdvancesCursor(t *testing.T) {
-	h := newHarness(t, 2, func(bot string, n int) string {
+	h := newHarness(t, 1, func(bot string, n int) string {
 		if n == 1 {
 			return "[SILENT]"
 		}
@@ -285,7 +285,7 @@ func TestSilentReplyIsNotATurnButAdvancesCursor(t *testing.T) {
 }
 
 func TestFailedCallKeepsCursor(t *testing.T) {
-	h := newHarness(t, 1, func(bot string, n int) string {
+	h := newHarness(t, 0, func(bot string, n int) string {
 		if n == 1 {
 			return "ERR"
 		}
@@ -299,7 +299,7 @@ func TestFailedCallKeepsCursor(t *testing.T) {
 }
 
 func TestUserMidTurnStopsChainAndReachesBot(t *testing.T) {
-	h := newHarness(t, 2, func(bot string, n int) string { return "reply " + bot })
+	h := newHarness(t, 1, func(bot string, n int) string { return "reply " + bot })
 	h.gate = make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -329,7 +329,7 @@ func TestUserMidTurnStopsChainAndReachesBot(t *testing.T) {
 }
 
 func TestBotMessagesNeverTrigger(t *testing.T) {
-	h := newHarness(t, 2, func(bot string, n int) string { return "x" })
+	h := newHarness(t, 1, func(bot string, n int) string { return "x" })
 	h.o.Handle(context.Background(), matrixio.Message{RoomID: roomID, EventID: "$b", Sender: "@ada:z", Body: "@Cleo hey", TS: 1})
 	h.o.Handle(context.Background(), matrixio.Message{RoomID: "!other:z", EventID: "$o", Sender: "@alex:z", Body: "hi", TS: 1})
 	if n := len(h.o.rooms[roomID].inbox); n != 0 {

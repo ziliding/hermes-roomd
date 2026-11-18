@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -119,7 +120,8 @@ type worker struct {
 	roster          *roster.Roster // the user plus this room's cast only
 	builder         *contextbuild.Builder
 	decider         turns.Decider
-	memory          Memory // nil: no group memory in this room
+	group           *roster.GroupMatcher // nil: no words address the whole group
+	memory          Memory               // nil: no group memory in this room
 	bots            map[string]*Bot
 	botKeys         []string      // this room's cast, stable order
 	notifier        string        // bot key that posts roomd's notices in this room
@@ -145,7 +147,10 @@ type RoomSpec struct {
 	ID      string
 	Roster  *roster.Roster // the user plus this room's cast
 	Decider turns.Decider  // this room's turn engine (cast, max_bot_turns)
-	Bots    []*Bot         // this room's cast
+	// Group recognises a user message addressed to the whole cast; every
+	// bot then owes a reply. nil: only named bots, or the decider's choice.
+	Group *roster.GroupMatcher
+	Bots  []*Bot // this room's cast
 	// Notifier is the bot key whose Poster posts roomd's notices in this
 	// room (its listener). Default: the first bot.
 	Notifier string
@@ -186,6 +191,7 @@ type Options struct {
 	Rooms           []string
 	Roster          *roster.Roster
 	Decider         turns.Decider
+	Group           *roster.GroupMatcher
 	Bots            []*Bot
 	Notifier        string
 	Memory          Memory
@@ -203,12 +209,12 @@ func New(o Options) *Orchestrator {
 	}
 	specs := append([]RoomSpec{}, o.RoomSpecs...)
 	for _, r := range o.Rooms {
-		specs = append(specs, RoomSpec{ID: r, Roster: o.Roster, Decider: o.Decider, Bots: o.Bots, Notifier: o.Notifier,
+		specs = append(specs, RoomSpec{ID: r, Roster: o.Roster, Decider: o.Decider, Group: o.Group, Bots: o.Bots, Notifier: o.Notifier,
 			Memory: o.Memory, BackgroundAfter: o.BackgroundAfter})
 	}
 	for _, sp := range specs {
 		w := &worker{
-			id: sp.ID, roster: sp.Roster, builder: contextbuild.New(sp.Roster), decider: sp.Decider,
+			id: sp.ID, roster: sp.Roster, builder: contextbuild.New(sp.Roster), decider: sp.Decider, group: sp.Group,
 			memory: sp.Memory, bots: map[string]*Bot{}, notifier: sp.Notifier, inbox: make(chan queued, 64),
 			backgroundAfter: sp.BackgroundAfter, busy: map[string]*job{}, noImages: map[string]int64{},
 		}
@@ -372,7 +378,7 @@ func (o *Orchestrator) command(ctx context.Context, w *worker, q queued) {
 		log.Info("explain", "bot", bot)
 		// One called turn: no router, no chain after it.
 		if _, out := o.speak(ctx, w, bot, commands.ExplainInstruction(w.roster.User().Display), q.msg); out == spoke {
-			w.state.BotSpoke(bot)
+			w.state.BotSpoke(bot, false)
 		}
 	}
 }
@@ -454,83 +460,130 @@ func (w *worker) busyBots() []string {
 	return out
 }
 
+// chain answers one user message. The decider's plan for it is the set of
+// bots that owe the user a reply. Whenever the floor is free, the first owed
+// bot in the latest plan speaks (the decider re-plans after every reply, so
+// the order is decided as it goes, never fixed up front). A bot that stays
+// silent, fails or hands its run to the background has met its obligation,
+// and the others carry on; its background result arrives later as a reply. Once nobody owes the user anything, bots may
+// continue among themselves, up to max_bot_turns; that continuation, and
+// only it, ends on silence. A new user message stops the chain.
 func (o *Orchestrator) chain(ctx context.Context, w *worker, q queued) {
 	trig := turns.Trigger{
-		RoomID:    w.id,
-		FromUser:  true,
-		Addressee: w.roster.Addressee(q.msg.Body, q.msg.FormattedBody, q.msg.Mentions, ""),
-		Body:      q.msg.Body,
+		RoomID:     w.id,
+		FromUser:   true,
+		Addressees: w.roster.Addressees(q.msg.Body, q.msg.FormattedBody, q.msg.Mentions, ""),
+		Group:      w.group.Match(q.msg.Body),
+		Body:       q.msg.Body,
 	}
+	st := w.state
+	st.Busy = w.busyBots()
+	plan, ok := o.decide(ctx, w, q, st, trig)
+	if !ok {
+		return
+	}
+	owed := slices.Clone(plan) // bots that still owe the user a reply
 	for ctx.Err() == nil {
-		if w.userEpoch.Load() != q.epoch {
-			o.log.Info("user spoke mid-chain; stopping", "room", w.id)
+		busy := w.busyBots()
+		pending := slices.DeleteFunc(slices.Clone(owed), func(b string) bool { return slices.Contains(busy, b) })
+		next, continuation := "", len(pending) == 0
+		switch {
+		case !continuation:
+			next = pending[0]
+			if i := slices.IndexFunc(plan, func(b string) bool { return slices.Contains(pending, b) }); i >= 0 {
+				next = plan[i]
+			}
+		case len(plan) > 0:
+			next = plan[0]
+		default:
+			o.log.Debug("turn decision: nobody speaks", "room", w.id, "bot_turns", w.state.BotTurns, "busy", busy)
 			return
 		}
-		st := w.state
-		st.Busy = w.busyBots()
-		next, ok, err := w.decider.Next(ctx, st, trig)
-		if err != nil {
-			o.log.Error("turn decision failed", "room", w.id, "err", err)
-			return
-		}
-		if !ok {
-			o.log.Debug("turn decision: nobody speaks", "room", w.id, "bot_turns", w.state.BotTurns, "busy", st.Busy)
-			return
-		}
-		if w.userEpoch.Load() != q.epoch {
-			// The user (or a command) arrived while the decider was thinking
-			// (the LLM router can take seconds): that decision is stale.
-			o.log.Info("user spoke while deciding; stopping", "room", w.id)
-			return
-		}
-		o.log.Debug("turn decision", "room", w.id, "next", next, "addressee", trig.Addressee, "bot_turns", w.state.BotTurns)
+		owed = slices.DeleteFunc(owed, func(b string) bool { return b == next })
+		o.log.Debug("turn decision", "room", w.id, "next", next, "owed", owed, "continuation", continuation, "bot_turns", w.state.BotTurns)
 		text, out := o.speak(ctx, w, next, "", q.msg)
-		switch out {
-		case silent:
-			// Silence or failure ends the chain; it is not a turn.
-			return
-		case backgrounded:
-			// The bot took the turn but works on in the background (its
-			// result later starts no chain). The others carry on, answering
-			// the same message, with the busy bot excluded.
-			w.state.BotSpoke(next)
+		if out == silent {
+			// Nothing new to react to. The next owed bot in the plan goes on
+			// (busy ones excluded); a bot with nothing to add ends the
+			// bot-to-bot exchange.
+			busy := w.busyBots()
+			if continuation || !slices.ContainsFunc(owed, func(b string) bool { return !slices.Contains(busy, b) }) {
+				return
+			}
 			continue
 		}
-		w.state.BotSpoke(next)
+		// A reply, or a hand-off to the background: the bot took its turn
+		// and the decider plans again, with a busy bot excluded.
+		w.state.BotSpoke(next, continuation)
 		trig = turns.Trigger{
-			RoomID:    w.id,
-			Sender:    next,
-			Addressee: w.roster.Addressee(text, "", nil, next),
-			Body:      text,
+			RoomID:     w.id,
+			Sender:     next,
+			Addressees: w.roster.Addressees(text, "", nil, next),
+			Handoff:    out == backgrounded,
+			Body:       text,
+		}
+		st = w.state
+		st.Busy = w.busyBots()
+		st.Owed = slices.DeleteFunc(slices.Clone(owed), func(b string) bool { return slices.Contains(st.Busy, b) })
+		if plan, ok = o.decide(ctx, w, q, st, trig); !ok {
+			return
 		}
 	}
 }
 
-// steer handles a user message that names a busy bot: it is steered into
-// that bot's run (acknowledged with a ✓ reaction from the bot) and starts
-// no chain. If Hermes refuses the steer, or the run ends without consuming
-// it, the message simply reaches the bot in its next delta. It reports
-// whether the message was addressed to a busy bot.
+// decide asks the room's decider for a plan. ok is false when the chain
+// must stop: the decision failed, or the user (or a command) arrived while
+// the decider was thinking (the LLM router can take seconds), which makes
+// the decision stale.
+func (o *Orchestrator) decide(ctx context.Context, w *worker, q queued, st turns.State, t turns.Trigger) ([]string, bool) {
+	if w.userEpoch.Load() != q.epoch {
+		o.log.Info("user spoke mid-chain; stopping", "room", w.id)
+		return nil, false
+	}
+	plan, err := w.decider.Plan(ctx, st, t)
+	if err != nil {
+		o.log.Error("turn decision failed", "room", w.id, "err", err)
+		return nil, false
+	}
+	if w.userEpoch.Load() != q.epoch {
+		o.log.Info("user spoke while deciding; stopping", "room", w.id)
+		return nil, false
+	}
+	return plan, true
+}
+
+// steer handles a user message that names busy bots: it is steered into
+// each one's run (acknowledged with a ✓ reaction from the bot). If Hermes
+// refuses a steer, or the run ends without consuming it, the message simply
+// reaches the bot in its next delta. It reports whether the message is
+// fully handled: it named only busy bots and is not addressed to the group,
+// so no chain starts. Otherwise the free bots it names (or the group) still
+// answer.
 func (o *Orchestrator) steer(ctx context.Context, w *worker, q queued) bool {
-	addr := w.roster.Addressee(q.msg.Body, q.msg.FormattedBody, q.msg.Mentions, "")
-	if addr == "" {
-		return false
+	steered, free := false, false
+	for _, addr := range w.roster.Addressees(q.msg.Body, q.msg.FormattedBody, q.msg.Mentions, "") {
+		if j := w.jobFor(addr); j != nil {
+			o.steerInto(ctx, w, q, addr, j)
+			steered = true
+		} else {
+			free = true
+		}
 	}
-	j := w.jobFor(addr)
-	if j == nil {
-		return false
-	}
+	return steered && !free && !w.group.Match(q.msg.Body)
+}
+
+func (o *Orchestrator) steerInto(ctx context.Context, w *worker, q queued, addr string, j *job) {
 	log := o.log.With("room", w.id, "bot", addr, "run", j.runID, "event", q.msg.EventID)
 	if q.msg.Image != nil {
 		// Steer input is text only: the image waits for the bot's next turn.
 		log.Info("image for a busy bot; it waits for the bot's next turn")
-		return true
+		return
 	}
 	e := entryOf(q.msg)
 	e.Seq = q.seq
 	text := w.builder.Build(addr, []transcript.Entry{e})
 	if text == "" {
-		return true
+		return
 	}
 	req := steerReq{seq: q.seq, text: text, reply: make(chan error, 1)}
 	var err error
@@ -540,17 +593,16 @@ func (o *Orchestrator) steer(ctx context.Context, w *worker, q queued) bool {
 	case <-j.polling:
 		err = fmt.Errorf("%w: the run already ended", hermes.ErrSteerRefused)
 	case <-ctx.Done():
-		return true
+		return
 	}
 	if err != nil {
 		log.Info("steer not delivered; the message waits for the bot's next turn", "err", err)
-		return true
+		return
 	}
 	log.Info("steered a message into the bot's background run")
 	if err := w.bots[addr].Poster.React(ctx, w.id, q.msg.EventID, SteerAck); err != nil {
 		log.Warn("reacting to a steered message", "err", err)
 	}
-	return true
 }
 
 // outcome is what one call to speak led to.

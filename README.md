@@ -22,22 +22,34 @@ Alex (Element X) ──► Matrix group room ◄── roomd ── 1. decide wh
 Only messages from the configured `user` start a turn chain. Bot messages are
 recorded but never trigger anything on their own.
 
-| Situation | Result |
-|---|---|
-| `max_bot_turns` consecutive bot replies | nobody speaks until the user does (hard cap) |
-| router on: a bot asks the user a question | the chain stops |
-| the user names a bot | that bot answers |
-| the user names nobody | the router picks; with the router off, a random bot (never the one that just spoke) |
-| a bot names another bot | router on: a hint only; router off: that bot is next |
+A user message is **owed** a reply by a set of bots. That set has no fixed
+order: whenever nobody is generating a reply, the decider (router or turn
+rules) picks the next one from the bots that still owe a reply.
 
+| The user's message | Who owes a reply |
+|---|---|
+| names bots ("Cleo and Ada, thoughts?") | each bot it names |
+| addresses the group (a `group_words` entry: "你们", "大家", "everyone", …) | every bot |
+| names nobody | router on: whoever the router plans (every bot when it says the message is for everyone; nobody for "ok", "thanks"); router off: one random bot |
+
+- **Owed replies are always delivered.** A bot that stays silent, fails or
+  hands its run to the background has met its obligation, and the next one
+  goes on. A question a bot asks the user in passing doesn't cancel the
+  others' replies. `max_bot_turns` doesn't count owed replies.
+- **Then the bots may talk among themselves**, at most `max_bot_turns` times
+  until the user speaks again. With the router on, a bot speaks
+  only if it is addressed or has something new to add, and the exchange
+  stops when the conversation is waiting on the user's answer. With the
+  router off, a bot the last message names goes next, otherwise a random
+  bot (never the one that just spoke). A bot that stays silent ends the
+  exchange.
 - **Mentions are hints, not triggers.** Display names, `@handles`, Matrix
-  ids, pills and `m.mentions` all count, but only the earliest addressee in a
-  message.
+  ids, pills and `m.mentions` all count.
 - **The user interrupts.** A new user message resets the counters. A reply
   already being generated still posts, and the new message starts a fresh
   chain.
 - **Silence.** A reply that is only a silence marker (`[SILENT]`, `NO_REPLY`,
-  `(silent)`, `🔇`, `.`, `…`) posts nothing and ends the chain.
+  `(silent)`, `🔇`, `.`, `…`) posts nothing.
 
 ### Images
 
@@ -98,7 +110,7 @@ work doesn't hold up the room:
 - **Hand-off.** A run still going after `background_after` (default 20s)
   continues in the background. The listener posts one notice ("Ada is
   working on it…"), the bot is **busy** in that room, and the room goes on.
-  The hand-off counts as the bot's turn, and the chain continues with the
+  The hand-off meets the bot's obligation, and the chain continues with the
   other bots. Quicker replies work as before.
 - **Busy bots are skipped.** Neither the turn rules nor the router pick a
   busy bot. Busy is per room, so the bot still answers in other rooms.
@@ -115,7 +127,8 @@ work doesn't hold up the room:
   iterations) still posts the text it has.
 - **Steering.** A message that names a busy bot is steered into its running
   task (Hermes `/v1/runs/{id}/steer`), attributed like any delta line. The
-  bot acknowledges it with a ✓ reaction, and no chain starts. A steered
+  bot acknowledges it with a ✓ reaction. No chain starts unless the message
+  also names a free bot or addresses the group; those still answer. A steered
   message counts as seen only if the run consumed it. One the run never
   read, or that Hermes refused, reaches the bot in its next delta, never
   twice. Messages to others aren't steered; the busy bot sees them on its
@@ -129,15 +142,41 @@ work doesn't hold up the room:
 ### The router (optional)
 
 With `router.enabled`, a separate cheap model (any OpenAI-compatible
-endpoint) answers `{"next": "<name>"}` or `{"next": null}`. **null, meaning
-wait for the user, is the default.** It sees the last `router.window`
-messages, each character's `blurb`, and how often each one has spoken
-recently. It picks someone only when that character is addressed, a question
-is still open, or the character clearly has something new to add.
+endpoint) answers with a response plan:
 
-- Malformed output, an unknown name, or the bot that just spoke: nobody
-  speaks.
-- A failed or timed-out call: the plain turn rules decide that turn.
+```json
+{"addressed_to": ["Ada"] | "all" | "user" | "none",
+ "user_question_pending": false,
+ "plan": ["Cleo", "Ada"],
+ "reason": "a few words"}
+```
+
+The analysis fields come first, so the model classifies the message before
+it picks anyone. It sees the last `router.window` messages, each character's
+`blurb`, who still owes the user a reply, who is busy, and how often each
+one has spoken recently. Few-shot examples in its prompt cover a group
+question and a question asked in passing.
+
+Code, not the model, keeps the rules:
+
+- **The user names bots:** they answer, with no call.
+- **The user addresses the group** (`group_words`, or the model says
+  `"all"`): every bot owes a reply, even if the model's `plan` lists fewer.
+- **Bots still owe the user:** the model only orders them and can't drop
+  any. With one left, there is no call.
+- **`user_question_pending`** only stops bots from talking among
+  themselves. The prompt counts it only when the message's main point is a
+  direct question to the user, not a question in passing or a rhetorical
+  one.
+- **Names are validated:** unknown names, busy bots and (between bots) the
+  bot that just spoke are dropped.
+- **Failures:** a failed or timed-out call lets the plain turn rules decide
+  that turn. So does an unusable answer, except between bots with nobody
+  owed a reply, where nobody speaks.
+- **Call log:** with `router.log_file`, every call is appended as one JSON
+  line (system prompt, input, raw output, parsed plan, model, latency and
+  the token usage the endpoint reports, including reasoning tokens), to
+  build an eval set from.
 - **Write real blurbs.** The router tells characters apart only by them, and
   roomd warns at startup when one is missing.
 
@@ -236,7 +275,10 @@ deploy/roomd.service        systemd user unit
 - **Top level:**
   - `homeserver`, `user`, `user_display`;
   - `rooms`;
-  - `max_bot_turns`, `max_delta_lines`;
+  - `max_bot_turns` (bot-to-bot replies after the owed ones), `max_delta_lines`;
+  - `group_words`: words that address every bot at once (default: 你们, 大家,
+    各位, everyone, everybody, all of you, you all, y'all, you guys; `[]`
+    turns it off);
   - `msgtype` (`m.text` or `m.notice`);
   - `state_db`, `group_rules_file`;
   - `hermes_timeout` (the most a run may take), `background_after` (when a
@@ -252,7 +294,7 @@ deploy/roomd.service        systemd user unit
   - `hermes.key_env`: that profile's `API_SERVER_KEY`;
   - `blurb`.
 - **`router`:** `enabled`, `base_url` (including `/v1`), `model`, `key_env`,
-  `timeout`, `window`, `json_mode`.
+  `timeout`, `window`, `json_mode`, `log_file`.
 - **`memory`:**
   - `enabled`;
   - `api_url`: Hindsight, without `/v1`;
