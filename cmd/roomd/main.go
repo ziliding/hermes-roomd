@@ -132,7 +132,7 @@ func run(ctx context.Context, cfgPath string, log *slog.Logger) error {
 	}()
 	log.Info("roomd ready", "rooms", len(cfg.Rooms), "bots", len(keys), "sync_loops", len(groups),
 		"router", cfg.Router.Enabled, "router_model", cfg.Router.Model,
-		"memory", cfg.Memory.Enabled, "retainers", len(retainers), "media_dirs", len(cfg.MediaDirs))
+		"memory", cfg.Memory.Enabled, "retainers", len(retainers), "summary_model", cfg.Memory.Retain.Summary.Model, "media_dirs", len(cfg.MediaDirs))
 
 	// Any sync loop failing stops roomd (systemd restarts it).
 	errc := make(chan error, len(groups))
@@ -219,7 +219,7 @@ func buildRooms(cfg *config.Config, store *transcript.Store, posters map[string]
 				var sum memory.Summarizer
 				if mc.Retain.Mode == config.RetainSummary {
 					sum = &memory.ChatSummarizer{
-						BaseURL: cfg.Router.BaseURL, APIKey: cfg.Router.Key, Model: cfg.Router.Model,
+						BaseURL: mc.Retain.Summary.BaseURL, APIKey: mc.Retain.Summary.Key, Model: mc.Retain.Summary.Model,
 						System: memory.SummaryPrompt(r),
 					}
 				}

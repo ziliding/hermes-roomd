@@ -106,7 +106,7 @@ type MemoryRecall struct {
 type RetainMode string
 
 const (
-	RetainSummary    RetainMode = "summary"    // a filtered summary written by the router's model
+	RetainSummary    RetainMode = "summary"    // a filtered summary written by the summary model (default: the router's)
 	RetainTranscript RetainMode = "transcript" // the attributed raw messages
 )
 
@@ -117,6 +117,20 @@ type MemoryRetain struct {
 	IdleMinutes int           `yaml:"idle_minutes"` // quiet time before a conversation is written
 	MinMessages int           `yaml:"min_messages"` // shorter conversations are skipped
 	Timeout     time.Duration `yaml:"timeout"`      // per summarizer call and per retain call
+	// Summary is the model that writes summary-mode notes. Each field left
+	// empty takes the router's (router.base_url, router.model,
+	// router.key_env), so configs without this block keep working.
+	Summary SummaryModel `yaml:"summary"`
+}
+
+// SummaryModel is an OpenAI-compatible chat model. After Load it holds the
+// effective values (router defaults filled in) and the resolved Key.
+type SummaryModel struct {
+	BaseURL string `yaml:"base_url"` // includes /v1
+	Model   string `yaml:"model"`
+	KeyEnv  string `yaml:"key_env"`
+
+	Key string `yaml:"-"` // resolved from the effective key_env
 }
 
 // RecallOn reports whether recall runs (memory on and recall not disabled).
@@ -696,17 +710,32 @@ func (c *Config) validateMemory(lookupEnv func(string) (string, bool), fail func
 		}
 	}
 	if anyRetain && m.Retain.Mode == RetainSummary {
-		// The summary is written by the router's model, which is configured
-		// even when the router itself is off.
-		r := &c.Router
-		if !strings.HasPrefix(r.BaseURL, "http://") && !strings.HasPrefix(r.BaseURL, "https://") {
-			fail("memory.retain.mode summary uses the router's model: router.base_url must be an http(s) URL (router.enabled may stay false)")
+		// The summary model defaults, field by field, to the router's, which
+		// is configured even when the router itself is off.
+		sm, r := &m.Retain.Summary, &c.Router
+		from := func(own, router *string, name string) string {
+			if strings.TrimSpace(*own) != "" {
+				return "memory.retain.summary." + name
+			}
+			*own = *router
+			return "router." + name + " (memory.retain.summary." + name + " is unset; router.enabled may stay false)"
 		}
-		if strings.TrimSpace(r.Model) == "" {
-			fail("memory.retain.mode summary uses the router's model: router.model is required (router.enabled may stay false)")
+		urlField, modelField := from(&sm.BaseURL, &r.BaseURL, "base_url"), from(&sm.Model, &r.Model, "model")
+		ownKey := strings.TrimSpace(sm.KeyEnv) != ""
+		keyField := from(&sm.KeyEnv, &r.KeyEnv, "key_env")
+		if !strings.HasPrefix(sm.BaseURL, "http://") && !strings.HasPrefix(sm.BaseURL, "https://") {
+			fail("memory.retain.mode summary: %s must be an http(s) URL", urlField)
 		}
-		if !r.Enabled { // when enabled, the key was resolved above
-			r.Key = resolveEnv(lookupEnv, r.KeyEnv, "router.key_env (for memory.retain.mode summary)", fail)
+		if strings.TrimSpace(sm.Model) == "" {
+			fail("memory.retain.mode summary: %s is required", modelField)
+		}
+		if !ownKey && r.Enabled {
+			sm.Key = r.Key // resolved above
+		} else {
+			sm.Key = resolveEnv(lookupEnv, sm.KeyEnv, keyField+" (for memory.retain.mode summary)", fail)
+			if !ownKey {
+				r.Key = sm.Key
+			}
 		}
 	}
 }

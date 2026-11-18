@@ -94,8 +94,9 @@ router:
 #     <memory source="past group chats"> block (never to the system prompt).
 #     Any error or timeout: logged, and the turn goes ahead without memory.
 #   retain: once a conversation has been quiet for idle_minutes (or !reset
-#     ended it), ONE document for it goes into the bank. mode summary uses the
-#     router's base_url/model/key_env (router.enabled may stay false).
+#     ended it), ONE document for it goes into the bank. mode summary uses
+#     retain.summary's model; each field left out takes the router's
+#     base_url/model/key_env (router.enabled may stay false).
 memory:
   enabled: false
   api_url: http://localhost:8888     # Hindsight server, without /v1
@@ -113,3 +114,7 @@ memory:
     idle_minutes: 30                 # quiet time before a conversation is written
     min_messages: 4                  # shorter conversations are not written
     timeout: 2m                      # per summarizer call and per Hindsight retain call
+    # summary:                       # the summary-mode model; each field left out takes the router's
+    #   base_url: https://api.venice.ai/api/v1
+    #   model: glm-5.3               # infrequent task: a stronger model than the per-turn router is affordable
+    #   key_env: ROOMD_SUMMARY_KEY

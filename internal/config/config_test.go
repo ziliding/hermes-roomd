@@ -220,6 +220,60 @@ func TestMemoryConfigDefaults(t *testing.T) {
 	if c.Router.Key != "rk" {
 		t.Fatal("summary mode must resolve the router key even with the router off")
 	}
+	// No summary block: the summary model is the router's.
+	if sm := m.Retain.Summary; sm.BaseURL != "https://api.example.com/v1" || sm.Model != c.Router.Model || sm.Key != "rk" || sm.KeyEnv != "ROOMD_ROUTER_KEY" {
+		t.Fatalf("summary model %+v, want the router's", sm)
+	}
+}
+
+func TestSummaryModelOverrides(t *testing.T) {
+	withSumKey := map[string]string{"SUM_KEY": "sk"}
+	for k, v := range withRouterKey {
+		withSumKey[k] = v
+	}
+	tests := []struct {
+		name, yaml                  string
+		env                         map[string]string
+		wantURL, wantModel, wantKey string
+		wantErr                     string
+	}{
+		{"model only: router url and key", good + routerOn + memoryOn + "  retain:\n    summary: {model: big}\n", withRouterKey,
+			"https://api.example.com/v1", "big", "rk", ""},
+		{"all three, router off", good + memoryOn + "  retain:\n    summary: {base_url: \"http://llm:8000/v1\", model: big, key_env: SUM_KEY}\n", withSumKey,
+			"http://llm:8000/v1", "big", "sk", ""},
+		{"own key env, router on", good + routerOn + memoryOn + "  retain:\n    summary: {key_env: SUM_KEY}\n", withSumKey,
+			"https://api.example.com/v1", "", "sk", ""},
+		{"own key env missing", good + routerOn + memoryOn + "  retain:\n    summary: {key_env: SUM_KEY}\n", withRouterKey,
+			"", "", "", "memory.retain.summary.key_env"},
+		{"bad own url", good + routerModelOnly + memoryOn + "  retain:\n    summary: {base_url: llm:8000}\n", withRouterKey,
+			"", "", "", "memory.retain.summary.base_url"},
+		{"no model anywhere", good + memoryOn + "  retain:\n    summary: {base_url: \"http://llm:8000/v1\", key_env: SUM_KEY}\n", withSumKey,
+			"", "", "", "router.model"},
+		{"transcript mode ignores it", good + memoryOn + "  retain:\n    mode: transcript\n    summary: {base_url: nope}\n", allEnv,
+			"nope", "", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := Parse([]byte(tt.yaml), env(tt.env))
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err %v, want it to mention %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			sm := c.Memory.Retain.Summary
+			wantModel := tt.wantModel
+			if wantModel == "" && c.Memory.Retain.Mode == RetainSummary {
+				wantModel = c.Router.Model
+			}
+			if sm.BaseURL != tt.wantURL || sm.Model != wantModel || sm.Key != tt.wantKey {
+				t.Fatalf("summary model %+v, want %s %s %s", sm, tt.wantURL, wantModel, tt.wantKey)
+			}
+		})
+	}
 }
 
 func TestMemoryConfigValidation(t *testing.T) {

@@ -245,7 +245,8 @@ profile's own memory.
   error or timeout means the turn goes ahead without memory.
 - **Retain:** after `retain.idle_minutes` of quiet, or a `!reset`, roomd
   writes **one** document for that conversation.
-  - **Summary mode (default):** the router's model writes notes that record
+  - **Summary mode (default):** the summary model (by default the router's
+    model; see `retain.summary`) writes notes that record
     what the user said and decided. Character statements are kept as
     opinions, and coined terms are dropped or marked.
   - **Transcript mode:** the attributed messages as they are.
@@ -308,9 +309,13 @@ deploy/roomd.service        systemd user unit
   - `api_url`: Hindsight, without `/v1`;
   - `bank_id`;
   - `recall.*`: `max_tokens`, `budget`, `timeout`, `min_score`;
-  - `retain.*`: `mode`, `idle_minutes`, `min_messages`, `timeout`.
-  - Summary mode uses the router's `base_url`, `model` and `key_env`, even
-    when the router is off.
+  - `retain.*`: `mode`, `idle_minutes`, `min_messages`, `timeout`,
+    `summary`.
+  - `retain.summary`: the model that writes summary-mode notes, as
+    `base_url`, `model` and `key_env`. Each field you leave out takes the
+    router's value, even when the router is off, so without the block summary
+    mode uses the router's model. Use it to run the infrequent summary on a
+    stronger model than the per-turn router.
 
 Secrets never go in the YAML: every `*_env` key names an environment
 variable. Relative paths resolve against the config file's folder.
