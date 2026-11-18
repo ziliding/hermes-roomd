@@ -104,6 +104,7 @@ type Orchestrator struct {
 	pollInterval  time.Duration
 	typingTimeout time.Duration
 	typingEvery   time.Duration
+	files         *media.Files // nil: image files named in replies are never read
 
 	rooms map[string]*worker
 	wg    sync.WaitGroup // room workers and their runs
@@ -171,6 +172,9 @@ type Options struct {
 	PollInterval  time.Duration
 	TypingTimeout time.Duration
 	TypingEvery   time.Duration
+	// Files reads image files a reply names (MEDIA: tags, bare paths), only
+	// from the allowed directories. nil: never.
+	Files *media.Files
 
 	Rooms           []string
 	Roster          *roster.Roster
@@ -188,6 +192,7 @@ func New(o Options) *Orchestrator {
 		log: o.Log, now: time.Now, rooms: map[string]*worker{},
 		runTimeout: or0(o.RunTimeout, DefaultRunTimeout), pollInterval: or0(o.PollInterval, DefaultPollInterval),
 		typingTimeout: or0(o.TypingTimeout, DefaultTypingTimeout), typingEvery: or0(o.TypingEvery, DefaultTypingEvery),
+		files: o.Files,
 	}
 	specs := append([]RoomSpec{}, o.RoomSpecs...)
 	for _, r := range o.Rooms {
@@ -823,8 +828,8 @@ func (o *Orchestrator) finish(ctx context.Context, w *worker, j *job, background
 	return reply.Text, spoke
 }
 
-// post sends a cleaned reply as the bot: its text and inline images in
-// their original order, each image as an m.image and text longer than one
+// post sends a cleaned reply as the bot: its text and images (inline data
+// URLs, and files it names inside media_dirs) in their original order, each image as an m.image and text longer than one
 // event allows split into several messages. Only the first event carries
 // the reply relation. Each event is recorded in the transcript, images as
 // "[image]", never their data. An image that fails to upload is replaced by
@@ -833,7 +838,7 @@ func (o *Orchestrator) finish(ctx context.Context, w *worker, j *job, background
 func (o *Orchestrator) post(ctx context.Context, w *worker, botKey, text, replyTo string, log *slog.Logger) (string, bool) {
 	bot := w.bots[botKey]
 	person, _ := w.roster.ByKey(botKey)
-	parts, dropped := media.Split(text)
+	parts, dropped := media.Split(text, o.files)
 	for _, d := range dropped {
 		log.Warn("left out of the posted reply", "what", d)
 	}

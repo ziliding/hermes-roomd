@@ -41,20 +41,29 @@ recorded but never trigger anything on their own.
 
 ### Images
 
-Hermes turns an image a bot made (`MEDIA:/path/to/file.png`) into an inline
-`![image](data:image/png;base64,…)` in the reply. roomd posts each one as a
-real Matrix image: it uploads it to the homeserver as that bot and sends an
-`m.image`.
+roomd posts a bot's images as real Matrix images: it uploads each one to
+the homeserver as that bot and sends an `m.image`. It recognises three
+shapes in a reply:
 
-- **Order:** the reply's text and images go out in their original order,
-  one event each. A background result's reply relation goes on the first
-  event.
+- **`MEDIA:/path/to/file.png` tags** and **bare absolute paths** ending in
+  `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` or `.bmp`. Hermes' Runs API
+  passes these through untouched, so roomd reads the file itself. It does
+  this only when the file, after resolving symlinks, lies inside one of
+  `media_dirs`. The file must also be a regular file of at most 10 MB
+  whose bytes are an image. With no `media_dirs`, roomd reads no files.
+- **Inline `![image](data:image/…;base64,…)`**, which Hermes' other
+  endpoints produce.
+
+How the reply is posted:
+
+- **Order:** text and images go out in their original order, one event
+  each. A background result's reply relation goes on the first event.
+- **No host paths:** a tag or path that became an image is removed from the
+  text. One that can't be sent (outside `media_dirs`, missing, too big, not
+  an image) becomes "(image could not be sent)" and is logged. A `MEDIA:`
+  tag for a non-image file is removed.
 - **Transcript:** each image is recorded as `[image]`, never its data, so
   deltas and memory stay small.
-- **Failures:** an image that fails to upload, or isn't a decodable image,
-  becomes "(image could not be sent)" and the rest still posts. `MEDIA:`
-  tags Hermes left alone (not an image, or too big) are removed, so no
-  server path reaches the room.
 - **Long text** is split into several messages, below Matrix's 64 KB event
   limit.
 
@@ -201,7 +210,9 @@ deploy/roomd.service        systemd user unit
   - `state_db`, `group_rules_file`;
   - `hermes_timeout` (the most a run may take), `background_after` (when a
     run moves to the background; `0` means always wait);
-  - `listener`: the bot whose roomd device runs `/sync` and posts notices.
+  - `listener`: the bot whose roomd device runs `/sync` and posts notices;
+  - `media_dirs`: absolute directories whose images bots may post by path
+    (for example an image generator's output folder).
 - **`bots.<key>`:**
   - `display`, `mxid`;
   - `access_token_env`: roomd's own device token, not the gateway's;
@@ -259,9 +270,11 @@ roomd refuses to start on:
 - duplicate display names or room ids, or a room alias instead of a room id;
 - a listener outside its room's cast;
 - a token that belongs to another user (`whoami`);
-- an encrypted room, or a listener that isn't joined to its room.
+- an encrypted room, or a listener that isn't joined to its room;
+- a `media_dirs` entry that doesn't exist on the host it runs on.
 
-`roomd -check -config <file>` runs the same validation and exits.
+`roomd -check -config <file>` runs the same config validation and exits.
+It doesn't contact Matrix or look for `media_dirs`, so it runs anywhere.
 
 ## Homelab setup
 
@@ -342,7 +355,8 @@ overwrites the homelab's copies.
 - **Docker:** `docker compose up -d --build` from the repository root. The
   container uses host networking, so it publishes no ports. It reads its
   secrets from `deploy/roomd.env`, and its config, rules and database live
-  in `deploy/data/`.
+  in `deploy/data/`. Bind-mount each `media_dirs` entry read-only at the
+  same path as on the host (see `compose.yaml`).
 
 roomd opens no ports. It only connects out to the homeserver, Hermes and,
 optionally, Hindsight and the router endpoint, and everything stays on the

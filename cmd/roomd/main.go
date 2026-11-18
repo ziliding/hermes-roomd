@@ -18,6 +18,7 @@ import (
 	"github.com/ziliding/hermes-roomd/internal/hermes"
 	"github.com/ziliding/hermes-roomd/internal/hindsight"
 	"github.com/ziliding/hermes-roomd/internal/matrixio"
+	"github.com/ziliding/hermes-roomd/internal/media"
 	"github.com/ziliding/hermes-roomd/internal/memory"
 	"github.com/ziliding/hermes-roomd/internal/room"
 	"github.com/ziliding/hermes-roomd/internal/roster"
@@ -37,6 +38,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		// media_dirs are checked when roomd starts, on the host that has them.
 		fmt.Printf("config ok: %d room(s), %d bot(s), router=%v, memory=%v\n", len(cfg.Rooms), len(cfg.Bots), cfg.Router.Enabled, cfg.Memory.Enabled)
 		return
 	}
@@ -60,6 +62,10 @@ func run(ctx context.Context, cfgPath string, log *slog.Logger) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
+	}
+	files, err := media.NewFiles(cfg.MediaDirs, media.MaxFileBytes)
+	if err != nil {
+		return fmt.Errorf("media_dirs: %w", err)
 	}
 	store, err := transcript.Open(ctx, cfg.StateDB)
 	if err != nil {
@@ -100,7 +106,7 @@ func run(ctx context.Context, cfgPath string, log *slog.Logger) error {
 		posters[k], runners[k] = senders[k], hermesFor[k]
 	}
 	specs, retainers := buildRooms(cfg, store, posters, runners, uint64(time.Now().UnixNano()), log)
-	orch := room.New(room.Options{Store: store, RoomSpecs: specs, MaxDeltaLines: cfg.MaxDeltaLines, Log: log, RunTimeout: cfg.HermesTimeout})
+	orch := room.New(room.Options{Store: store, RoomSpecs: specs, MaxDeltaLines: cfg.MaxDeltaLines, Log: log, RunTimeout: cfg.HermesTimeout, Files: files})
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -116,7 +122,7 @@ func run(ctx context.Context, cfgPath string, log *slog.Logger) error {
 	}()
 	log.Info("roomd ready", "rooms", len(cfg.Rooms), "bots", len(keys), "sync_loops", len(groups),
 		"router", cfg.Router.Enabled, "router_model", cfg.Router.Model,
-		"memory", cfg.Memory.Enabled, "retainers", len(retainers))
+		"memory", cfg.Memory.Enabled, "retainers", len(retainers), "media_dirs", len(cfg.MediaDirs))
 
 	// Any sync loop failing stops roomd (systemd restarts it).
 	errc := make(chan error, len(groups))

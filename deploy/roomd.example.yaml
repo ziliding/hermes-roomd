@@ -27,6 +27,8 @@ state_db: ./roomd.db    # SQLite: transcript, cursors, session generations (rela
 group_rules_file: ./rules/rules.md   # system prompt; {{name}} {{user}} {{others}} are filled per bot
 hermes_timeout: 5m      # most a bot's run may take (agent runs with tools can take minutes); then it is stopped
 background_after: 20s   # a run still going after this continues in the background and the room moves on; 0 = always wait
+media_dirs:             # images a bot names by path (MEDIA:/path or a bare /path.png) are read and posted
+  - /home/alex/ComfyUI/output    # only from these dirs (absolute; symlinks resolved; ≤ 10 MB). Empty: never read files
 listener: cleo          # default listener: whose roomd device runs /sync (default: first bot key alphabetically);
                         # a room whose cast lacks it uses its first cast bot, or its own listener:
 

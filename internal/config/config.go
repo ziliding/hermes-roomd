@@ -248,11 +248,14 @@ type Config struct {
 	HermesTimeout  time.Duration `yaml:"hermes_timeout"`
 	// BackgroundAfter: a run still going after this long continues in the
 	// background and the room moves on (nil: the default; 0: never).
-	BackgroundAfter *Duration       `yaml:"background_after"`
-	Listener        string          `yaml:"listener"` // bot key whose roomd device runs /sync
-	Bots            map[string]*Bot `yaml:"bots"`
-	Router          Router          `yaml:"router"`
-	Memory          Memory          `yaml:"memory"`
+	BackgroundAfter *Duration `yaml:"background_after"`
+	Listener        string    `yaml:"listener"` // bot key whose roomd device runs /sync
+	// MediaDirs are the directories roomd may read image files from when a
+	// bot's reply names one (absolute paths; empty: never read files).
+	MediaDirs []string        `yaml:"media_dirs"`
+	Bots      map[string]*Bot `yaml:"bots"`
+	Router    Router          `yaml:"router"`
+	Memory    Memory          `yaml:"memory"`
 
 	GroupRules string `yaml:"-"` // contents of GroupRulesFile
 }
@@ -498,6 +501,11 @@ func (c *Config) validate(lookupEnv func(string) (string, bool)) error {
 	}
 	if c.BackgroundAfter != nil {
 		checkBackgroundAfter("background_after", time.Duration(*c.BackgroundAfter), c.HermesTimeout, fail)
+	}
+	for _, d := range c.MediaDirs {
+		if !filepath.IsAbs(d) {
+			fail("media_dirs: %q must be an absolute path", d)
+		}
 	}
 	if c.HermesTimeout < 0 {
 		fail("hermes_timeout must be positive")

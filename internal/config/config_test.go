@@ -72,6 +72,7 @@ func TestParseRejects(t *testing.T) {
 		{"router enabled without model", good + strings.Replace(routerOn, "  model: flash\n", "", 1), withRouterKey, "router.model"},
 		{"router enabled with bad url", good + strings.Replace(routerOn, "https://api.example.com/v1", "api.example.com", 1), withRouterKey, "router.base_url"},
 		{"router unknown field", good + routerOn + "  bogus: 1\n", withRouterKey, "bogus"},
+		{"relative media dir", good + "media_dirs: [output]\n", allEnv, "media_dirs: \"output\" must be an absolute path"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

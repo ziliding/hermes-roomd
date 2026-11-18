@@ -10,3 +10,6 @@ services:
     env_file: ./deploy/roomd.env
     volumes:
       - ./deploy/data:/data   # roomd.yaml, rules/, roomd.db
+      # Each media_dirs entry, read-only, at the same path as on the host
+      # (the path a bot writes in its reply):
+      # - /home/alex/ComfyUI/output:/home/alex/ComfyUI/output:ro

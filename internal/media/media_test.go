@@ -65,7 +65,7 @@ func TestSplit(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			parts, dropped := Split(tt.in)
+			parts, dropped := Split(tt.in, nil)
 			if got := describe(parts); got != tt.want {
 				t.Fatalf("got  %q\nwant %q", got, tt.want)
 			}
@@ -83,14 +83,14 @@ func TestSplit(t *testing.T) {
 
 func TestSplitKeepsImageBytes(t *testing.T) {
 	p := pngData(t, 4, 4)
-	parts, _ := Split("x " + tag("image", "image/png", p))
+	parts, _ := Split("x "+tag("image", "image/png", p), nil)
 	if len(parts) != 2 || !bytes.Equal(parts[1].Image.Data, p) {
 		t.Fatalf("parts %+v", parts)
 	}
 }
 
 func TestTranscriptPlaceholder(t *testing.T) {
-	parts, _ := Split("Here:\n" + tag("image", "image/png", pngData(t, 1, 1)) + "\nBye")
+	parts, _ := Split("Here:\n"+tag("image", "image/png", pngData(t, 1, 1))+"\nBye", nil)
 	if got := Transcript(parts); got != "Here:\n[image]\nBye" {
 		t.Fatalf("transcript %q", got)
 	}
