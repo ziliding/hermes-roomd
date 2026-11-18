@@ -472,3 +472,29 @@ func TestPartialRunIsPosted(t *testing.T) {
 		})
 	}
 }
+
+// While Ada works in the background, the others are told so in their run
+// input (not in the transcript); once she is done the status is gone.
+func TestOthersSeeBusyStatus(t *testing.T) {
+	release := make(chan struct{})
+	h := newHarnessWith(t, harnessOpts{maxTurns: 2, backgroundAfter: 20 * time.Millisecond}, slowAda(release))
+	startBusyAda(t, h)
+	status := `Ada is working on a task in the background, started by Alex's message "Ada, draw a cat in Canva". ` +
+		`Ada's result will be posted when it is done; don't do that task yourself or answer for Ada.`
+
+	calls := h.waitCalls(2)
+	if calls[1].bot != "cleo" || !strings.Contains(calls[1].raw, "</messages>\n\n"+status+"\n\nReply as Cleo") {
+		t.Fatalf("cleo's input lacks the busy status:\n%s", calls[1].raw)
+	}
+	if strings.Contains(calls[1].delta, "working on") {
+		t.Fatalf("status leaked into the messages: %q", calls[1].delta)
+	}
+
+	close(release)
+	h.waitPosts(2)
+	h.waitIdle()
+	h.o.Handle(h.ctx, h.user("Cleo, and now?"))
+	if c := h.waitCalls(3)[2]; c.bot != "cleo" || strings.Contains(c.raw, "in the background") {
+		t.Fatalf("status still shown after Ada finished: %+v", c)
+	}
+}

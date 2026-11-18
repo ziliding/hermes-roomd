@@ -113,6 +113,9 @@ func stripReplyFallback(body string) string {
 	return body
 }
 
+// Escape escapes text as Msg does a message's text.
+func Escape(text string) string { return textEscaper.Replace(text) }
+
 // Msg renders one message element.
 func Msg(from, text string) string {
 	return `<msg from="` + attrEscaper.Replace(from) + `">` + textEscaper.Replace(text) + `</msg>`

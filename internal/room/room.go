@@ -371,7 +371,7 @@ func (o *Orchestrator) command(ctx context.Context, w *worker, q queued) {
 		}
 		log.Info("explain", "bot", bot)
 		// One called turn: no router, no chain after it.
-		if _, out := o.speak(ctx, w, bot, commands.ExplainInstruction(w.roster.User().Display), q.msg.EventID); out == spoke {
+		if _, out := o.speak(ctx, w, bot, commands.ExplainInstruction(w.roster.User().Display), q.msg); out == spoke {
 			w.state.BotSpoke(bot)
 		}
 	}
@@ -400,6 +400,46 @@ func (w *worker) jobFor(bot string) *job {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.busy[bot]
+}
+
+// busyStatus tells bot self which other bots are busy in the background and
+// with what ("" when none are), so it doesn't do their task or answer for them.
+func (w *worker) busyStatus(self string) string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var lines []string
+	for _, k := range w.botKeys {
+		j := w.busy[k]
+		if j == nil || k == self {
+			continue
+		}
+		name := display(w, k)
+		line := name + " is working on a task in the background"
+		if j.request != "" {
+			line += ", started by " + j.request
+		}
+		lines = append(lines, line+". "+name+"'s result will be posted when it is done; don't do that task yourself or answer for "+name+".")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// maxRequestQuote is how much of the request a busy status quotes.
+const maxRequestQuote = 160
+
+// describeRequest renders the message that started a run for the busy
+// status, e.g. Alex's message "draw a cat" (mentions rewritten, escaped like
+// message text, shortened).
+func (o *Orchestrator) describeRequest(w *worker, m matrixio.Message) string {
+	e := entryOf(m)
+	text := w.builder.Rewrite(e.Body, e.FormattedBody)
+	if text == "" {
+		return ""
+	}
+	if r := []rune(text); len(r) > maxRequestQuote {
+		text = strings.TrimSpace(string(r[:maxRequestQuote])) + "…"
+	}
+	text = strings.Join(strings.Fields(text), " ")
+	return w.roster.DisplayFor(m.Sender) + "'s message \"" + contextbuild.Escape(text) + "\""
 }
 
 func (w *worker) busyBots() []string {
@@ -444,7 +484,7 @@ func (o *Orchestrator) chain(ctx context.Context, w *worker, q queued) {
 			return
 		}
 		o.log.Debug("turn decision", "room", w.id, "next", next, "addressee", trig.Addressee, "bot_turns", w.state.BotTurns)
-		text, out := o.speak(ctx, w, next, "", q.msg.EventID)
+		text, out := o.speak(ctx, w, next, "", q.msg)
 		switch out {
 		case silent:
 			// Silence or failure ends the chain; it is not a turn.
@@ -534,6 +574,7 @@ type job struct {
 	delta   string   // for CleanReply
 	memIDs  []string // memories in the input, delivered on success
 	replyTo string   // the message that started the chain (background replies)
+	request string   // what that message asked, for other bots' busy status
 	resets  int64    // w.resets when the run started
 	start   time.Time
 
@@ -559,8 +600,9 @@ type steerReq struct {
 // speak makes one bot take one turn. It reports the posted text and the
 // outcome. A non-empty instruction (used by /explain) is added to the
 // framed delta, and the bot is called even when it has nothing new.
-// replyTo is the message a background result replies to.
-func (o *Orchestrator) speak(ctx context.Context, w *worker, botKey, instruction, replyTo string) (string, outcome) {
+// req is the message that started the chain: a background result replies
+// to it, and other bots are told the bot is working on it.
+func (o *Orchestrator) speak(ctx context.Context, w *worker, botKey, instruction string, req matrixio.Message) (string, outcome) {
 	roomID := w.id
 	resets := w.resets.Load()
 	bot, ok := w.bots[botKey]
@@ -625,7 +667,7 @@ func (o *Orchestrator) speak(ctx context.Context, w *worker, botKey, instruction
 		memory, memIDs = w.memory.Block(ctx, roomID, sid)
 	}
 	start := o.now()
-	framed := FrameMemory(delta, person.Display, instruction, memory)
+	framed := FrameStatus(delta, person.Display, instruction, memory, w.busyStatus(botKey))
 	att := o.images(ctx, w, bot.Poster, botKey, person.MXID, fresh, log)
 	runID, err := bot.Hermes.Start(ctx, sid, bot.System, att.input(framed), att.images...)
 	if errors.Is(err, hermes.ErrRejected) && len(att.images) > 0 {
@@ -640,7 +682,7 @@ func (o *Orchestrator) speak(ctx context.Context, w *worker, botKey, instruction
 	}
 	j := &job{
 		bot: botKey, runID: runID, sid: sid, upTo: upTo, imgSeq: att.lastSeq, delta: delta, memIDs: memIDs,
-		replyTo: replyTo, resets: resets, start: start,
+		replyTo: req.EventID, request: o.describeRequest(w, req), resets: resets, start: start,
 		steers: make(chan steerReq), polling: make(chan struct{}), done: make(chan struct{}), announced: make(chan struct{}),
 	}
 	o.wg.Add(1)
@@ -978,6 +1020,13 @@ func FrameWith(delta, self, instruction string) string {
 // past group chats), placed before the new messages and clearly separated
 // from them. The system message is never changed.
 func FrameMemory(delta, self, instruction, memory string) string {
+	return FrameStatus(delta, self, instruction, memory, "")
+}
+
+// FrameStatus is FrameMemory plus the room's current status (which other
+// bots are busy with a background task), placed after the messages. It
+// describes now, so it is never recorded in the transcript.
+func FrameStatus(delta, self, instruction, memory, status string) string {
 	var b strings.Builder
 	if memory != "" {
 		b.WriteString(memory + "\n\n")
@@ -986,6 +1035,9 @@ func FrameMemory(delta, self, instruction, memory string) string {
 		b.WriteString("There are no new messages in the group chat since your last reply.\n\n")
 	} else {
 		b.WriteString("New messages in the group chat since your last reply:\n\n<messages>\n" + delta + "\n</messages>\n\n")
+	}
+	if status != "" {
+		b.WriteString(status + "\n\n")
 	}
 	if instruction != "" {
 		b.WriteString(instruction + "\n\n")

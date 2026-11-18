@@ -102,6 +102,11 @@ work doesn't hold up the room:
   other bots. Quicker replies work as before.
 - **Busy bots are skipped.** Neither the turn rules nor the router pick a
   busy bot. Busy is per room, so the bot still answers in other rooms.
+- **The others know.** While a bot is busy, every other bot's run input
+  gets a status line after the messages: who is working in the background
+  and on whose message, so they don't do that task or answer for it. The
+  line isn't recorded in the transcript, so it disappears when the bot is
+  done.
 - **The result** is posted by the bot as a Matrix reply to the message that
   asked for it. It starts no chain.
 - **Failure.** If the run fails, is cancelled or exceeds `hermes_timeout`
