@@ -26,7 +26,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -133,6 +132,10 @@ type worker struct {
 
 	mu   sync.Mutex
 	busy map[string]*job // bot key -> its background run
+	// noImages: bot key -> the last image seq of a run that failed while
+	// carrying images. Those images are left out of the retry, so one image
+	// the model rejects can't fail the bot's every turn.
+	noImages map[string]int64
 }
 
 // RoomSpec is one room's cast and settings. Each Bot's System is that
@@ -207,7 +210,7 @@ func New(o Options) *Orchestrator {
 		w := &worker{
 			id: sp.ID, roster: sp.Roster, builder: contextbuild.New(sp.Roster), decider: sp.Decider,
 			memory: sp.Memory, bots: map[string]*Bot{}, notifier: sp.Notifier, inbox: make(chan queued, 64),
-			backgroundAfter: sp.BackgroundAfter, busy: map[string]*job{},
+			backgroundAfter: sp.BackgroundAfter, busy: map[string]*job{}, noImages: map[string]int64{},
 		}
 		for _, b := range sp.Bots {
 			w.bots[b.Key] = b
@@ -521,6 +524,7 @@ type job struct {
 	runID   string
 	sid     string
 	upTo    int64    // the delta's last seq: the cursor once the run succeeds
+	imgSeq  int64    // the last attached image's seq (0: no images)
 	delta   string   // for CleanReply
 	memIDs  []string // memories in the input, delivered on success
 	replyTo string   // the message that started the chain (background replies)
@@ -615,19 +619,21 @@ func (o *Orchestrator) speak(ctx context.Context, w *worker, botKey, instruction
 		memory, memIDs = w.memory.Block(ctx, roomID, sid)
 	}
 	start := o.now()
-	images, notes := o.images(ctx, w, bot.Poster, person.MXID, fresh, log)
-	input := FrameMemory(delta, person.Display, instruction, memory)
-	if len(images) > 0 || len(notes) > 0 {
-		input += "\n\n" + imagesNote(len(images), notes)
+	framed := FrameMemory(delta, person.Display, instruction, memory)
+	att := o.images(ctx, w, bot.Poster, botKey, person.MXID, fresh, log)
+	runID, err := bot.Hermes.Start(ctx, sid, bot.System, att.input(framed), att.images...)
+	if errors.Is(err, hermes.ErrRejected) && len(att.images) > 0 {
+		log.Warn("hermes refused the run with images; retrying without them", "err", err)
+		att = att.withoutImages(w, botKey)
+		runID, err = bot.Hermes.Start(ctx, sid, bot.System, att.input(framed))
 	}
-	runID, err := bot.Hermes.Start(ctx, sid, bot.System, input, images...)
 	if err != nil {
 		// Cursor stays put: the same delta is offered next time.
 		log.Error("starting hermes run", "session", sid, "err", err)
 		return "", silent
 	}
 	j := &job{
-		bot: botKey, runID: runID, sid: sid, upTo: upTo, delta: delta, memIDs: memIDs,
+		bot: botKey, runID: runID, sid: sid, upTo: upTo, imgSeq: att.lastSeq, delta: delta, memIDs: memIDs,
 		replyTo: replyTo, resets: resets, start: start,
 		steers: make(chan steerReq), polling: make(chan struct{}), done: make(chan struct{}), announced: make(chan struct{}),
 	}
@@ -787,6 +793,12 @@ func (o *Orchestrator) finish(ctx context.Context, w *worker, j *job, background
 		// Cursor stays put: the same delta (and any steered message) is
 		// offered next time.
 		log.Error("hermes run produced no reply", "run", j.runID, "status", j.run.Status, "err", err)
+		if j.imgSeq > 0 && j.run.Status == "failed" {
+			log.Warn("the run carried images; the retry leaves them out")
+			w.mu.Lock()
+			w.noImages[botKey] = max(w.noImages[botKey], j.imgSeq)
+			w.mu.Unlock()
+		}
 		if background {
 			o.notice(ctx, w, failureNotice(person.Display, j.run.Status))
 		}
@@ -1052,44 +1064,101 @@ func imageLine(name string) string {
 	return "[image: " + name + "]"
 }
 
-// MaxImages is the most images attached to one run; older ones in the same
-// delta are mentioned but not sent.
-const MaxImages = 4
+// Per-run image limits: at most MaxImages (the newest) and MaxImageBytes
+// in all after downscaling (Hermes refuses request bodies over 10 MB, and
+// base64 adds a third).
+const (
+	MaxImages     = 4
+	MaxImageBytes = 5 << 20
+)
+
+// attachments are the images for one run and notes on those left out.
+type attachments struct {
+	images  []hermes.Image
+	notes   []string
+	lastSeq int64 // the last attached image's seq
+}
+
+// input is the framed delta plus a paragraph about the images.
+func (a attachments) input(framed string) string {
+	var b strings.Builder
+	switch n := len(a.images); n {
+	case 0:
+	case 1:
+		b.WriteString("The image posted above is attached after this text; look at it.")
+	default:
+		b.WriteString("The " + strconv.Itoa(n) + " images posted above are attached after this text, in order; look at them.")
+	}
+	for _, note := range a.notes {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(note)
+	}
+	if b.Len() == 0 {
+		return framed
+	}
+	return framed + "\n\n" + b.String()
+}
+
+// withoutImages turns every attached image into a note and remembers them
+// as refused, so later turns don't try them again either.
+func (a attachments) withoutImages(w *worker, botKey string) attachments {
+	w.mu.Lock()
+	w.noImages[botKey] = max(w.noImages[botKey], a.lastSeq)
+	w.mu.Unlock()
+	out := attachments{notes: a.notes}
+	for _, img := range a.images {
+		out.notes = append(out.notes, strings.TrimSuffix(img.Label, ":")+" could not be sent to the model.")
+	}
+	return out
+}
 
 // images downloads (as the bot) the images posted in entries by anyone else
-// and returns them labelled for the run input, newest MaxImages at most. An
-// image that can't be used becomes a short note instead.
-func (o *Orchestrator) images(ctx context.Context, w *worker, p Poster, self string, entries []transcript.Entry, log *slog.Logger) ([]hermes.Image, []string) {
+// and returns them labelled for the run input. An image that can't be used
+// becomes a short note instead.
+func (o *Orchestrator) images(ctx context.Context, w *worker, p Poster, botKey, self string, entries []transcript.Entry, log *slog.Logger) attachments {
+	var a attachments
 	var posted []transcript.Entry
+	w.mu.Lock()
+	refused := w.noImages[botKey]
+	w.mu.Unlock()
 	for _, e := range entries {
-		if e.MediaURL != "" && e.Sender != self {
+		switch {
+		case e.MediaURL == "" || e.Sender == self:
+		case e.Seq <= refused:
+			a.notes = append(a.notes, describeImage(w, e)+" could not be sent to the model.")
+		default:
 			posted = append(posted, e)
 		}
 	}
-	var notes []string
 	if extra := len(posted) - MaxImages; extra > 0 {
 		for _, e := range posted[:extra] {
-			notes = append(notes, describeImage(w, e)+" is not attached (at most "+strconv.Itoa(MaxImages)+" images per turn).")
+			a.notes = append(a.notes, describeImage(w, e)+" is not attached (at most "+strconv.Itoa(MaxImages)+" images per turn).")
 		}
 		posted = posted[extra:]
 	}
-	var out []hermes.Image
+	total := 0
 	for _, e := range posted {
 		data, err := p.Download(ctx, e.MediaURL, media.MaxFileBytes)
 		mime := ""
 		if err == nil {
-			if mime = http.DetectContentType(data); !strings.HasPrefix(mime, "image/") {
-				err = fmt.Errorf("not an image (%s)", mime)
-			}
+			mime, data, err = media.ForVision(data, media.VisionMaxEdge)
 		}
 		if err != nil {
 			log.Warn("image not attached", "event", e.EventID, "url", e.MediaURL, "err", err)
-			notes = append(notes, describeImage(w, e)+" could not be loaded.")
+			a.notes = append(a.notes, describeImage(w, e)+" could not be loaded.")
 			continue
 		}
-		out = append(out, hermes.Image{Label: describeImage(w, e) + ":", MIME: mime, Data: data})
+		if total+len(data) > MaxImageBytes {
+			a.notes = append(a.notes, describeImage(w, e)+" is not attached (the images are too large together).")
+			continue
+		}
+		total += len(data)
+		a.images = append(a.images, hermes.Image{Label: describeImage(w, e) + ":", MIME: mime, Data: data})
+		a.lastSeq = e.Seq
 	}
-	return out, notes
+	return a
 }
 
 // describeImage names an image by who posted it and its file name.
@@ -1108,23 +1177,4 @@ func imageName(body string) string {
 		}
 	}
 	return ""
-}
-
-// imagesNote tells the bot about the attached images (and any left out).
-func imagesNote(n int, notes []string) string {
-	var b strings.Builder
-	switch n {
-	case 0:
-	case 1:
-		b.WriteString("The image posted above is attached after this text; look at it.")
-	default:
-		b.WriteString("The " + strconv.Itoa(n) + " images posted above are attached after this text, in order; look at them.")
-	}
-	for _, note := range notes {
-		if b.Len() > 0 {
-			b.WriteString("\n")
-		}
-		b.WriteString(note)
-	}
-	return b.String()
 }

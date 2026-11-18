@@ -158,3 +158,47 @@ func TestImageForBusyBotWaitsForItsNextTurn(t *testing.T) {
 		t.Fatalf("next call %+v", c)
 	}
 }
+
+// Hermes refusing a run with images (413: body too large) doesn't cost the
+// turn: roomd starts it again without them, and never retries them.
+func TestRejectedImagesAreDropped(t *testing.T) {
+	h := newHarness(t, 1, func(bot string, n int) string { return "ok" })
+	h.media = map[string][]byte{"mxc://example.com/cat": testPNG(t)}
+	h.srv.StartStatus = func(n int) int {
+		if n == 1 {
+			return 413
+		}
+		return 0
+	}
+	h.runMsg(h.userImage("cat.png", "Ada?", "mxc://example.com/cat"))
+	if len(h.calls) != 1 || len(h.calls[0].images) != 0 || !strings.Contains(h.calls[0].raw, "Image from Alex (cat.png) could not be sent to the model.") {
+		t.Fatalf("calls %+v", h.calls)
+	}
+	if len(h.posts) != 1 {
+		t.Fatalf("posts %v", h.posts)
+	}
+}
+
+// A run that fails while carrying images is retried on the next turn
+// without them, so one image the model rejects can't jam the bot.
+func TestFailedRunWithImagesRetriesWithoutThem(t *testing.T) {
+	h := newHarness(t, 1, func(bot string, n int) string {
+		if n == 1 {
+			return "ERR"
+		}
+		return "ok"
+	})
+	h.media = map[string][]byte{"mxc://example.com/cat": testPNG(t)}
+	h.runMsg(h.userImage("cat.png", "Ada?", "mxc://example.com/cat"))
+	if len(h.calls) != 1 || len(h.calls[0].images) != 1 || len(h.posts) != 0 {
+		t.Fatalf("calls %+v posts %v", h.calls, h.posts)
+	}
+	h.runOne("Ada, again?")
+	c := h.calls[1]
+	if len(c.images) != 0 || !strings.Contains(c.delta, "[image: cat.png] Ada?") || !strings.Contains(c.raw, "(cat.png) could not be sent to the model.") {
+		t.Fatalf("retry %+v", c)
+	}
+	if len(h.posts) != 1 {
+		t.Fatalf("posts %v", h.posts)
+	}
+}

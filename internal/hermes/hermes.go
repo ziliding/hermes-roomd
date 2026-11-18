@@ -115,6 +115,10 @@ func (r Run) Reply() (Reply, error) {
 // cancelled, interrupted or lost run, HTTP errors, exhausted 429 retries.
 var ErrNoReply = errors.New("hermes: no reply")
 
+// ErrRejected means Hermes refused the request itself (a 4xx other than
+// 429), so sending it again unchanged won't help.
+var ErrRejected = fmt.Errorf("%w: request rejected", ErrNoReply)
+
 // ErrRunNotFound means Hermes no longer knows the run (HTTP 404): its
 // outcome is lost. Other polling errors are transient.
 var ErrRunNotFound = fmt.Errorf("%w: run not found", ErrNoReply)
@@ -210,7 +214,11 @@ func (c *Client) Start(ctx context.Context, sessionID, instructions, input strin
 			continue
 		}
 		if code != http.StatusOK && code != http.StatusAccepted {
-			return "", fmt.Errorf("%w: HTTP %d: %s%s", ErrNoReply, code, errorMessage(raw), statusHint(code))
+			kind := ErrNoReply
+			if code >= 400 && code < 500 {
+				kind = ErrRejected
+			}
+			return "", fmt.Errorf("%w: HTTP %d: %s%s", kind, code, errorMessage(raw), statusHint(code))
 		}
 		var st runStatus
 		if err := json.Unmarshal(raw, &st); err != nil || st.RunID == "" {

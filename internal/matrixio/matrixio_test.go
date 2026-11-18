@@ -244,7 +244,7 @@ func TestDownloadLimit(t *testing.T) {
 	}
 	s := &Sender{cli: cli}
 	data, err := s.Download(context.Background(), "mxc://example.com/abc", 10)
-	if err != nil || string(data) != "0123456789" || !strings.HasSuffix(path, "/download/example.com/abc") {
+	if err != nil || string(data) != "0123456789" || path != "/_matrix/client/v1/media/download/example.com/abc" {
 		t.Fatalf("data %q err %v path %q", data, err, path)
 	}
 	if _, err := s.Download(context.Background(), "mxc://example.com/abc", 9); err == nil {

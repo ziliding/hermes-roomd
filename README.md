@@ -50,9 +50,15 @@ look at them:
   and attaches it to the run input as an `image_url` part (a data URL),
   after a label such as `Image from Alex (cat.png):`. Each image reaches
   each bot once, like the text around it.
-- At most 4 images (the newest) and 10 MB each go into one run. Older ones,
-  and ones that can't be downloaded or aren't images, become a one-line
-  note in the input instead.
+- Images are scaled down to at most 1568 px on the longest side. Anything
+  other than a small PNG or JPEG is re-encoded as JPEG, because Hermes
+  refuses request bodies over 10 MB.
+- A run takes at most 4 images (the newest), each downloaded at most 10 MB
+  and 5 MB in all after scaling. Older images, and ones that can't be
+  downloaded or decoded, become a one-line note in the input instead.
+- If Hermes refuses a run with images, or the run fails while carrying
+  them, roomd sends that turn again without the images, with a note in
+  their place.
 - An image is never steered into a busy bot's run (steer input is text
   only); it waits for that bot's next turn.
 - The bots' model must accept images. A text-only model rejects the run
