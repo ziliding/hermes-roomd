@@ -112,8 +112,11 @@ go run ./cmd/routereval \
   -price z-ai-glm-5-3-flash=0.15/0.50 \
   -price z-ai-glm-5-3=1.75/5.50 \
   -n 3 -v -out /tmp/routereval.jsonl \
-  evals/examples.jsonl evals/mine.jsonl
+  evals/examples.jsonl
 ```
+
+Add `evals/mine.jsonl` (or any other set) after `evals/examples.jsonl` once
+you have one. A missing file is an error.
 
 Flags:
 
