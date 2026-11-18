@@ -145,9 +145,14 @@ func TestSlowRunIsBackgroundedAndRepliesLater(t *testing.T) {
 	}}, slowAda(release))
 	reqID := startBusyAda(t, h)
 
+	// The hand-off is Ada's turn; the chain goes on without her.
+	if posts := h.waitPosts(1); posts[0] != "cleo: reply cleo" {
+		t.Fatalf("after the hand-off: posts %v", posts)
+	}
+
 	// The room goes on: only Cleo can speak, and then nobody (Ada is busy).
 	h.o.Handle(h.ctx, h.user("anyone around?"))
-	if posts := h.waitPosts(1); posts[0] != "cleo: reply cleo" {
+	if posts := h.waitPosts(2); posts[1] != "cleo: reply cleo" {
 		t.Fatalf("posts %v", posts)
 	}
 	waitFor(t, func() bool { spy.mu.Lock(); defer spy.mu.Unlock(); return len(spy.busy) >= 3 })
@@ -160,13 +165,13 @@ func TestSlowRunIsBackgroundedAndRepliesLater(t *testing.T) {
 	spy.mu.Unlock()
 
 	close(release)
-	posts := h.waitPosts(2)
-	if posts[1] != "ada: drawn: a cat ↩ "+reqID {
-		t.Fatalf("background result %q, want a reply to %s", posts[1], reqID)
+	posts := h.waitPosts(3)
+	if posts[2] != "ada: drawn: a cat ↩ "+reqID {
+		t.Fatalf("background result %q, want a reply to %s", posts[2], reqID)
 	}
 	h.waitIdle()
 	time.Sleep(30 * time.Millisecond)
-	if _, _, _, _, calls := h.snap(); len(calls) != 2 {
+	if _, _, _, _, calls := h.snap(); len(calls) != 3 {
 		t.Fatalf("the background result started a chain: %d calls", len(calls))
 	}
 	_, _, _, typing, _ := h.snap()
@@ -177,10 +182,10 @@ func TestSlowRunIsBackgroundedAndRepliesLater(t *testing.T) {
 	// Ada's cursor moved to the end of her request's delta: her next turn
 	// sees what happened meanwhile, not the request again.
 	h.o.Handle(h.ctx, h.user("Ada, nice"))
-	calls := h.waitCalls(3)
-	want := "<msg from=\"Alex\">anyone around?</msg>\n<msg from=\"Cleo\">reply cleo</msg>\n<msg from=\"Alex\">Ada, nice</msg>"
-	if calls[2].bot != "ada" || calls[2].delta != want {
-		t.Fatalf("ada's next delta %+v", calls[2])
+	calls := h.waitCalls(4)
+	want := "<msg from=\"Cleo\">reply cleo</msg>\n<msg from=\"Alex\">anyone around?</msg>\n<msg from=\"Cleo\">reply cleo</msg>\n<msg from=\"Alex\">Ada, nice</msg>"
+	if calls[3].bot != "ada" || calls[3].delta != want {
+		t.Fatalf("ada's next delta %+v", calls[3])
 	}
 }
 
@@ -355,14 +360,12 @@ func TestBusyIsPerRoom(t *testing.T) {
 	h.o.Handle(h.ctx, h.say(roomID, "Ada, draw a cat"))
 	waitFor(t, func() bool { return len(h.o.rooms[roomID].busyBots()) == 1 })
 	h.o.Handle(h.ctx, h.say(roomB, "Ada, quick one"))
-	if p := h.waitPosts(1); p[0] != "ada: reply ada" {
-		t.Fatalf("ada should answer in the other room: %v", p)
-	}
+	waitFor(t, func() bool { p, _, _, _, _ := h.snap(); return slices.Contains(p, "ada: reply ada") })
 	if b := h.o.rooms[roomB].busyBots(); len(b) != 0 {
 		t.Fatalf("room B busy %v", b)
 	}
 	close(release)
-	h.waitPosts(2)
+	waitFor(t, func() bool { p, _, _, _, _ := h.snap(); return slices.ContainsFunc(p, func(s string) bool { return strings.HasPrefix(s, "ada: drawn: a cat ↩ ") }) })
 }
 
 func TestShutdownWithRunInFlightDoesNotHang(t *testing.T) {

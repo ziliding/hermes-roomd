@@ -445,10 +445,16 @@ func (o *Orchestrator) chain(ctx context.Context, w *worker, q queued) {
 		}
 		o.log.Debug("turn decision", "room", w.id, "next", next, "addressee", trig.Addressee, "bot_turns", w.state.BotTurns)
 		text, out := o.speak(ctx, w, next, "", q.msg.EventID)
-		if out != spoke {
-			// Silence or failure ends the chain; it is not a turn. A run handed
-			// to the background ends it too: its result starts no chain.
+		switch out {
+		case silent:
+			// Silence or failure ends the chain; it is not a turn.
 			return
+		case backgrounded:
+			// The bot took the turn but works on in the background (its
+			// result later starts no chain). The others carry on, answering
+			// the same message, with the busy bot excluded.
+			w.state.BotSpoke(next)
+			continue
 		}
 		w.state.BotSpoke(next)
 		trig = turns.Trigger{

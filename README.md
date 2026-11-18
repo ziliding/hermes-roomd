@@ -98,7 +98,8 @@ work doesn't hold up the room:
 - **Hand-off.** A run still going after `background_after` (default 20s)
   continues in the background. The listener posts one notice ("Ada is
   working on it…"), the bot is **busy** in that room, and the room goes on.
-  Quicker replies work as before.
+  The hand-off counts as the bot's turn, and the chain continues with the
+  other bots. Quicker replies work as before.
 - **Busy bots are skipped.** Neither the turn rules nor the router pick a
   busy bot. Busy is per room, so the bot still answers in other rooms.
 - **The result** is posted by the bot as a Matrix reply to the message that
