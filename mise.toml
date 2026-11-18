@@ -1,0 +1,19 @@
+[tools]
+go = "1.27"
+
+[tasks.test]
+description = "Vet and run all tests with the race detector"
+run = "go vet ./... && go test -race ./..."
+
+[tasks.build]
+description = "Build roomd for this machine into dist/"
+run = "go build -trimpath -o dist/roomd ./cmd/roomd"
+
+[tasks.deploy]
+description = "Test, build for the homelab, upload binary + rules + unit, restart (ROOMD_HOST, --no-restart)"
+depends = ["test"]
+run = "scripts/deploy.sh"
+
+[tasks.logs]
+description = "Follow roomd's log on the homelab"
+run = 'ssh -t "${ROOMD_HOST:-homelab}" journalctl --user -u roomd -f -o cat'

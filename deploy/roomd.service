@@ -1,0 +1,22 @@
+# systemd user unit. Install:
+#   mkdir -p ~/.config/systemd/user ~/.config/roomd
+#   cp deploy/roomd.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now roomd
+#   loginctl enable-linger $USER   # keep running without a login session
+[Unit]
+Description=roomd: multi-bot Matrix group rooms for Hermes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.config/roomd
+EnvironmentFile=%h/.config/roomd/roomd.env
+ExecStart=%h/.local/bin/roomd -config %h/.config/roomd/roomd.yaml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,108 @@
+# roomd configuration. Copy to roomd.yaml and edit.
+# Secrets never go in this file: each *_env names an environment variable.
+
+homeserver: http://127.0.0.1:6167        # Tuwunel client API (tailnet / loopback)
+user: "@alex:example.com"               # the human; the only one whose messages trigger turns
+user_display: Alex                       # how the user is labelled in bot context: [Alex]
+rooms:                                   # room IDs from Room settings → Advanced (not #aliases); every bot must be joined
+  - "!abc:example.com"                  # room v12+ IDs have no :server part, e.g. "!K2xh…PcoU"
+  # A room can also be a mapping that overrides the top-level settings for
+  # that room only (every key except id is optional):
+  # - id: "!def:example.com"
+  #   name: lounge                       # label for logs
+  #   bots: [ada, cleo]                  # the cast: who takes part here (default: all bots)
+  #   listener: cleo                      # whose roomd device syncs this room and posts its notices; must be in bots
+  #   max_bot_turns: 3
+  #   rules_file: rules/lounge.md        # this room's group rules (default: group_rules_file)
+  #   memory:                            # needs memory.enabled: true (below)
+  #     bank_id: roomd-lounge            # this room's own bank: nothing from other rooms comes up here
+  #     recall: { enabled: true }
+  #     retain: { enabled: true, idle_minutes: 30, min_messages: 4 }
+
+max_bot_turns: 4        # consecutive bot replies after a user message, then wait for the user
+max_delta_lines: 40     # most transcript lines sent to a bot in one call (caps a bot's first call)
+msgtype: m.text         # or m.notice (clients render notices as bot output, no notifications)
+state_db: ./roomd.db    # SQLite: transcript, cursors, session generations (relative to this file)
+group_rules_file: ./rules/rules.md   # system prompt; {{name}} {{user}} {{others}} are filled per bot
+hermes_timeout: 5m      # per call; agent runs with tools can take minutes
+listener: cleo          # default listener: whose roomd device runs /sync (default: first bot key alphabetically);
+                        # a room whose cast lacks it uses its first cast bot, or its own listener:
+
+bots:
+  ada:
+    display: Ada
+    mxid: "@ada:example.com"
+    access_token_env: ROOMD_ADA_TOKEN          # roomd's OWN device token for @ada, not the gateway's
+    hermes:
+      base_url: http://127.0.0.1:8642/p/ada   # profile selected by URL (or one port per profile)
+      key_env: ROOMD_ADA_API_KEY                    # that profile's API_SERVER_KEY
+      # model: ""     # optional; omitted from the request when empty. NOT a profile selector.
+    blurb: "One-line character description"
+  cleo:
+    display: Cleo
+    mxid: "@cleo:example.com"
+    access_token_env: ROOMD_CLEO_TOKEN
+    hermes:
+      base_url: http://127.0.0.1:8642/p/cleo
+      key_env: ROOMD_CLEO_API_KEY
+    blurb: "One-line character description"
+  bram:
+    display: Bram
+    mxid: "@bram:example.com"
+    access_token_env: ROOMD_BRAM_TOKEN
+    hermes:
+      base_url: http://127.0.0.1:8642/p/bram
+      key_env: ROOMD_BRAM_API_KEY
+    blurb: "One-line character description"
+  dex:
+    display: Dex
+    mxid: "@dex:example.com"
+    access_token_env: ROOMD_DEX_TOKEN
+    hermes:
+      base_url: http://127.0.0.1:8642/p/dex
+      key_env: ROOMD_DEX_API_KEY
+    blurb: "One-line character description"
+
+# LLM turn router (optional). With enabled: false, or with this
+# block left out, roomd uses the deterministic turn rules only.
+# When enabled, a separate cheap model picks who speaks next as
+# {"next": "<name>"} or {"next": null}; null (wait for the user) is the default.
+# max_bot_turns stays a hard ceiling, and if a router call fails or times out
+# the turn rules decide that turn.
+router:
+  enabled: false
+  base_url: https://api.venice.ai/api/v1   # OpenAI-style base INCLUDING /v1 (unlike hermes.base_url); roomd appends /chat/completions
+  model: "<router model id>"               # e.g. your DeepSeek Flash id; list ids with GET <base_url>/models
+  key_env: ROOMD_ROUTER_API_KEY            # env var holding the API key
+  timeout: 15s                             # per router call; on timeout the turn rules decide
+  window: 12                               # recent messages the router sees
+  json_mode: true                          # sends response_format json_object; set false if the endpoint rejects it
+
+# Shared memory of past group chats (optional). A Hindsight bank that
+# ONLY roomd reads and writes; the bots never write to it, and it is separate
+# from each profile's own memory. With enabled: false, or this block left out,
+# roomd behaves exactly as without it.
+#   recall: before each called bot turn, a short query built from the recent
+#     messages; what comes back is added to that turn's user message as a
+#     <memory source="past group chats"> block (never to the system prompt).
+#     Any error or timeout: logged, and the turn goes ahead without memory.
+#   retain: once a conversation has been quiet for idle_minutes (or !reset
+#     ended it), ONE document for it goes into the bank. mode summary uses the
+#     router's base_url/model/key_env (router.enabled may stay false).
+memory:
+  enabled: false
+  api_url: http://localhost:8888     # Hindsight server, without /v1
+  bank_id: roomd-group               # created on the first write; never use a profile's bank (e.g. hermes-cleo)
+  # api_key_env: ROOMD_HINDSIGHT_KEY # only if your Hindsight requires a key
+  recall:
+    enabled: true
+    max_tokens: 400                  # Hindsight max_tokens for the recalled memories
+    budget: mid                      # low | mid | high
+    timeout: 3s                      # per recall; on timeout the turn goes ahead without memory
+    min_score: 0.25                  # drop memories less relevant than this (0..1)
+  retain:
+    enabled: true
+    mode: summary                    # summary (filtered notes by the router's model) | transcript (raw attributed messages)
+    idle_minutes: 30                 # quiet time before a conversation is written
+    min_messages: 4                  # shorter conversations are not written
+    timeout: 2m                      # per summarizer call and per Hindsight retain call

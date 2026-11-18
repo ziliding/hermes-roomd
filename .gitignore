@@ -1,0 +1,9 @@
+roomd.yaml
+roomd.db*
+*.env
+!deploy/roomd.env.example
+/roomd
+deploy/data/
+/roomd-linux
+dist/
+roomd-linux

@@ -1,0 +1,12 @@
+# docker compose up -d --build
+# network_mode: host so roomd reaches Tuwunel and Hermes on 127.0.0.1 and
+# opens no ports of its own (it only makes outbound connections).
+services:
+  roomd:
+    build: .
+    restart: unless-stopped
+    network_mode: host
+    user: "${UID:-1000}:${GID:-1000}"   # distroless runs as 65532; match the owner of deploy/data
+    env_file: ./deploy/roomd.env
+    volumes:
+      - ./deploy/data:/data   # roomd.yaml, rules/, roomd.db
