@@ -120,7 +120,15 @@ work doesn't hold up the room:
   line isn't recorded in the transcript, so it disappears when the bot is
   done.
 - **The result** is posted by the bot as a Matrix reply to the message that
-  asked for it. It starts no chain.
+  asked for it, but only when the floor is free. If another bot is mid-reply,
+  the result waits in the room's queue until that turn ends, then posts
+  before the next turn. The bot stays busy until its result is in the room.
+- **The result is a new event.** The router (or the turn rules) may let the
+  others react to it. That is bot-to-bot continuation: it shares
+  `max_bot_turns` with any other bot-to-bot replies since the user last
+  wrote (the result itself isn't counted), and it never creates new
+  obligations to the user. If the user has written since the run ended,
+  nobody reacts; their message is answered instead.
 - **Failure.** If the run fails, is cancelled or exceeds `hermes_timeout`
   (roomd then stops it), the listener posts a short notice. The request
   stays in the bot's next delta.  A turn that ends unfinished (for example out of

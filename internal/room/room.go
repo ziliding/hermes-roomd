@@ -10,9 +10,12 @@
 // A run that is still going after the room's background_after hands off to
 // the background: the listener posts one notice, the bot is marked busy in
 // that room (never picked for a turn), and the room goes on. When the run
-// ends, its result is posted as a reply to the message that asked for it,
-// without starting a chain. A user message that names a busy bot is steered
-// into its run instead of starting a chain.
+// ends, its result joins the worker's queue and is posted, as a reply to the
+// message that asked for it, once the floor is free (between two turns of a
+// chain, or when the worker is idle). The posted result is a new event: the
+// other bots may react to it, as bot-to-bot continuation under
+// max_bot_turns; it never creates obligations to the user. A user message
+// that names a busy bot is steered into its run instead of starting a chain.
 //
 // The user's commands (/reset, /explain) are never recorded as conversation.
 // They go through the same worker queue, so they never race a turn, and they
@@ -128,6 +131,7 @@ type worker struct {
 	backgroundAfter time.Duration // 0: never hand a run off to the background
 
 	inbox     chan queued
+	held      []queued     // taken from inbox while draining results; handled first (worker goroutine only)
 	userEpoch atomic.Int64 // bumped by every user message and command as it arrives
 	resets    atomic.Int64 // bumped by every /reset as it arrives
 	state     turns.State  // touched only by the worker goroutine
@@ -166,6 +170,10 @@ type queued struct {
 	epoch int64
 	cmd   *commands.Command // non-nil for a command
 	upTo  int64             // newest seq when the command arrived (for /reset)
+	// result is a background run that ended; the worker posts it when the
+	// floor is free. epoch is the user epoch when it ended: a user message
+	// that arrived since stops any reaction to it.
+	result *job
 }
 
 // Options configures New. Each room comes from RoomSpecs; the rooms listed
@@ -314,26 +322,114 @@ func (o *Orchestrator) enqueueCommand(ctx context.Context, w *worker, m matrixio
 
 func (o *Orchestrator) work(ctx context.Context, w *worker) {
 	for {
-		select {
-		case <-ctx.Done():
+		q, ok := w.next(ctx)
+		if !ok {
 			return
-		case q := <-w.inbox:
-			if q.cmd != nil {
-				o.command(ctx, w, q)
-				continue
-			}
-			// Before coalescing: a message to a busy bot is steered even when
-			// a newer one is already queued.
-			if o.steer(ctx, w, q) {
-				w.state.UserSpoke()
-				continue
-			}
-			if q.epoch != w.userEpoch.Load() {
-				continue // a newer user message is queued; it carries the context
-			}
-			w.state.UserSpoke()
-			o.chain(ctx, w, q)
 		}
+		switch {
+		case q.result != nil:
+			o.result(ctx, w, q)
+			continue
+		case q.cmd != nil:
+			o.command(ctx, w, q)
+			continue
+		}
+		// Results that ended before this message are posted first (with no
+		// reaction: the user has spoken), so a bot whose result is queued is
+		// free again rather than steered into a run that already ended.
+		o.results(ctx, w)
+		// Before coalescing: a message to a busy bot is steered even when
+		// a newer one is already queued.
+		if o.steer(ctx, w, q) {
+			w.state.UserSpoke()
+			continue
+		}
+		if q.epoch != w.userEpoch.Load() {
+			continue // a newer user message is queued; it carries the context
+		}
+		w.state.UserSpoke()
+		o.chain(ctx, w, q)
+	}
+}
+
+// next is the worker's next item: one held back while draining results
+// first, then the inbox.
+func (w *worker) next(ctx context.Context) (queued, bool) {
+	if len(w.held) > 0 {
+		q := w.held[0]
+		w.held = w.held[1:]
+		return q, true
+	}
+	select {
+	case <-ctx.Done():
+		return queued{}, false
+	case q := <-w.inbox:
+		return q, true
+	}
+}
+
+// results posts every background result waiting in the inbox, now that the
+// floor is free. Other items are held, in order, for the worker. It returns
+// the trigger for the last result posted (ok false when none was).
+func (o *Orchestrator) results(ctx context.Context, w *worker) (trig turns.Trigger, ok bool) {
+	for {
+		select {
+		case q := <-w.inbox:
+			if q.result == nil {
+				w.held = append(w.held, q)
+				continue
+			}
+			if t, posted := o.postResult(ctx, w, q.result); posted {
+				trig, ok = t, true
+			}
+		default:
+			return trig, ok
+		}
+	}
+}
+
+// postResult posts one background result and records it as the bot's
+// turn. It is not counted against max_bot_turns: it answers the request
+// that started the task. It returns the trigger for the posted message.
+func (o *Orchestrator) postResult(ctx context.Context, w *worker, j *job) (turns.Trigger, bool) {
+	text, out := o.finish(ctx, w, j, true)
+	if out != spoke {
+		return turns.Trigger{}, false
+	}
+	w.state.BotSpoke(j.bot, false)
+	return o.botTrigger(w, j.bot, text, false), true
+}
+
+// result handles a background result reaching the idle worker: it is
+// posted, and the others may react to it. That is bot-to-bot continuation
+// only (nobody owes the user anything new), under max_bot_turns, and a user
+// message that arrived since the run ended stops it before it starts.
+func (o *Orchestrator) result(ctx context.Context, w *worker, q queued) {
+	trig, ok := o.postResult(ctx, w, q.result)
+	if !ok {
+		return
+	}
+	if t, more := o.results(ctx, w); more {
+		trig = t // another result landed meanwhile; it is the latest event
+	}
+	st := w.state
+	st.Busy = w.busyBots()
+	plan, ok := o.decide(ctx, w, q.epoch, st, trig)
+	if !ok {
+		return
+	}
+	o.log.Debug("reacting to a background result", "room", w.id, "bot", q.result.bot, "plan", plan)
+	o.turns(ctx, w, q.epoch, q.result.req, plan, nil)
+}
+
+// botTrigger describes a bot's message (or its hand-off) to the decider.
+func (o *Orchestrator) botTrigger(w *worker, bot, text string, handoff bool) turns.Trigger {
+	return turns.Trigger{
+		RoomID:     w.id,
+		Sender:     bot,
+		Addressees: w.roster.Addressees(text, "", nil, bot),
+		Handoff:    handoff,
+		Body:       text,
 	}
 }
 
@@ -465,8 +561,9 @@ func (w *worker) busyBots() []string {
 // bot in the latest plan speaks (the decider re-plans after every reply, so
 // the order is decided as it goes, never fixed up front). A bot that stays
 // silent, fails or hands its run to the background has met its obligation,
-// and the others carry on; its background result arrives later as a reply. Once nobody owes the user anything, bots may
-// continue among themselves, up to max_bot_turns; that continuation, and
+// and the others carry on; its background result is posted later, between
+// two turns or once the chain ends. Once nobody owes the user anything, bots
+// may continue among themselves, up to max_bot_turns; that continuation, and
 // only it, ends on silence. A new user message stops the chain.
 func (o *Orchestrator) chain(ctx context.Context, w *worker, q queued) {
 	trig := turns.Trigger{
@@ -478,11 +575,19 @@ func (o *Orchestrator) chain(ctx context.Context, w *worker, q queued) {
 	}
 	st := w.state
 	st.Busy = w.busyBots()
-	plan, ok := o.decide(ctx, w, q, st, trig)
+	plan, ok := o.decide(ctx, w, q.epoch, st, trig)
 	if !ok {
 		return
 	}
-	owed := slices.Clone(plan) // bots that still owe the user a reply
+	o.turns(ctx, w, q.epoch, q.msg, plan, slices.Clone(plan))
+}
+
+// turns runs bot turns from a first plan until nobody speaks. owed is the
+// set of bots that still owe the user a reply (nil after a background
+// result). req is the message that started it all: a bot that hands its run
+// to the background replies to it. Between two turns, background results
+// that ended meanwhile are posted and become the latest event.
+func (o *Orchestrator) turns(ctx context.Context, w *worker, epoch int64, req matrixio.Message, plan, owed []string) {
 	for ctx.Err() == nil {
 		busy := w.busyBots()
 		pending := slices.DeleteFunc(slices.Clone(owed), func(b string) bool { return slices.Contains(busy, b) })
@@ -501,8 +606,19 @@ func (o *Orchestrator) chain(ctx context.Context, w *worker, q queued) {
 		}
 		owed = slices.DeleteFunc(owed, func(b string) bool { return b == next })
 		o.log.Debug("turn decision", "room", w.id, "next", next, "owed", owed, "continuation", continuation, "bot_turns", w.state.BotTurns)
-		text, out := o.speak(ctx, w, next, "", q.msg)
-		if out == silent {
+		text, out := o.speak(ctx, w, next, "", req)
+		var trig turns.Trigger
+		event := out != silent
+		if event {
+			// A reply, or a hand-off to the background: the bot took its turn.
+			w.state.BotSpoke(next, continuation)
+			trig = o.botTrigger(w, next, text, out == backgrounded)
+		}
+		// The floor is free: post results that ended meanwhile.
+		if t, ok := o.results(ctx, w); ok {
+			trig, event = t, true
+		}
+		if !event {
 			// Nothing new to react to. The next owed bot in the plan goes on
 			// (busy ones excluded); a bot with nothing to add ends the
 			// bot-to-bot exchange.
@@ -512,20 +628,12 @@ func (o *Orchestrator) chain(ctx context.Context, w *worker, q queued) {
 			}
 			continue
 		}
-		// A reply, or a hand-off to the background: the bot took its turn
-		// and the decider plans again, with a busy bot excluded.
-		w.state.BotSpoke(next, continuation)
-		trig = turns.Trigger{
-			RoomID:     w.id,
-			Sender:     next,
-			Addressees: w.roster.Addressees(text, "", nil, next),
-			Handoff:    out == backgrounded,
-			Body:       text,
-		}
-		st = w.state
+		// The decider plans again, with busy bots excluded.
+		st := w.state
 		st.Busy = w.busyBots()
 		st.Owed = slices.DeleteFunc(slices.Clone(owed), func(b string) bool { return slices.Contains(st.Busy, b) })
-		if plan, ok = o.decide(ctx, w, q, st, trig); !ok {
+		var ok bool
+		if plan, ok = o.decide(ctx, w, epoch, st, trig); !ok {
 			return
 		}
 	}
@@ -535,8 +643,8 @@ func (o *Orchestrator) chain(ctx context.Context, w *worker, q queued) {
 // must stop: the decision failed, or the user (or a command) arrived while
 // the decider was thinking (the LLM router can take seconds), which makes
 // the decision stale.
-func (o *Orchestrator) decide(ctx context.Context, w *worker, q queued, st turns.State, t turns.Trigger) ([]string, bool) {
-	if w.userEpoch.Load() != q.epoch {
+func (o *Orchestrator) decide(ctx context.Context, w *worker, epoch int64, st turns.State, t turns.Trigger) ([]string, bool) {
+	if w.userEpoch.Load() != epoch {
 		o.log.Info("user spoke mid-chain; stopping", "room", w.id)
 		return nil, false
 	}
@@ -545,7 +653,7 @@ func (o *Orchestrator) decide(ctx context.Context, w *worker, q queued, st turns
 		o.log.Error("turn decision failed", "room", w.id, "err", err)
 		return nil, false
 	}
-	if w.userEpoch.Load() != q.epoch {
+	if w.userEpoch.Load() != epoch {
 		o.log.Info("user spoke while deciding; stopping", "room", w.id)
 		return nil, false
 	}
@@ -621,13 +729,14 @@ type job struct {
 	bot     string
 	runID   string
 	sid     string
-	upTo    int64    // the delta's last seq: the cursor once the run succeeds
-	imgSeq  int64    // the last attached image's seq (0: no images)
-	delta   string   // for CleanReply
-	memIDs  []string // memories in the input, delivered on success
-	replyTo string   // the message that started the chain (background replies)
-	request string   // what that message asked, for other bots' busy status
-	resets  int64    // w.resets when the run started
+	upTo    int64            // the delta's last seq: the cursor once the run succeeds
+	imgSeq  int64            // the last attached image's seq (0: no images)
+	delta   string           // for CleanReply
+	memIDs  []string         // memories in the input, delivered on success
+	req     matrixio.Message // the message that started the chain
+	replyTo string           // its event id (background replies)
+	request string           // what that message asked, for other bots' busy status
+	resets  int64            // w.resets when the run started
 	start   time.Time
 
 	steers    chan steerReq
@@ -734,7 +843,7 @@ func (o *Orchestrator) speak(ctx context.Context, w *worker, botKey, instruction
 	}
 	j := &job{
 		bot: botKey, runID: runID, sid: sid, upTo: upTo, imgSeq: att.lastSeq, delta: delta, memIDs: memIDs,
-		replyTo: req.EventID, request: o.describeRequest(w, req), resets: resets, start: start,
+		req: req, replyTo: req.EventID, request: o.describeRequest(w, req), resets: resets, start: start,
 		steers: make(chan steerReq), polling: make(chan struct{}), done: make(chan struct{}), announced: make(chan struct{}),
 	}
 	o.wg.Add(1)
@@ -771,7 +880,8 @@ func (o *Orchestrator) speak(ctx context.Context, w *worker, botKey, instruction
 
 // follow polls one run until it ends, keeping the bot shown as typing and
 // passing steers to Hermes. On hermes_timeout it stops the run. A foreground
-// run's result goes back to the worker; a background run is finished here.
+// run's result goes back to speak; a background run's joins the worker's
+// queue.
 func (o *Orchestrator) follow(ctx context.Context, w *worker, j *job) {
 	defer o.wg.Done()
 	bot := w.bots[j.bot]
@@ -857,8 +967,15 @@ loop:
 		close(j.done)
 	}
 	w.mu.Unlock()
-	if background {
-		o.finish(ctx, w, j, true)
+	if !background {
+		return
+	}
+	// The worker posts the result when the floor is free. The bot stays busy
+	// until then, so it is not picked before its result is in the room.
+	select {
+	case w.inbox <- queued{result: j, epoch: w.userEpoch.Load()}:
+	case <-ctx.Done():
+		log.Warn("roomd is stopping; a finished background result will not be posted", "session", j.sid)
 	}
 }
 

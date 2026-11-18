@@ -134,12 +134,13 @@ func TestTypingIsRefreshedWhileARunGoes(t *testing.T) {
 }
 
 // A slow run is handed off; the room goes on without Ada (the rules never
-// pick her), and her result arrives as a reply to the request, starting no
-// chain.
+// pick her), and her result arrives as a reply to the request. The result
+// is a new event: the others may react to it, up to max_bot_turns.
 func TestSlowRunIsBackgroundedAndRepliesLater(t *testing.T) {
 	release := make(chan struct{})
 	spy := &spyDecider{}
-	h := newHarnessWith(t, harnessOpts{maxTurns: 1, backgroundAfter: 20 * time.Millisecond, decider: func(bots []string) turns.Decider {
+	// Long enough that only Ada's held run is handed off, even under -race.
+	h := newHarnessWith(t, harnessOpts{maxTurns: 1, backgroundAfter: 200 * time.Millisecond, decider: func(bots []string) turns.Decider {
 		spy.inner = turns.NewRules(bots, 2, rand.New(rand.NewPCG(1, 1)))
 		return spy
 	}}, slowAda(release))
@@ -157,7 +158,7 @@ func TestSlowRunIsBackgroundedAndRepliesLater(t *testing.T) {
 	}
 	waitFor(t, func() bool { spy.mu.Lock(); defer spy.mu.Unlock(); return len(spy.busy) >= 3 })
 	spy.mu.Lock()
-	for i, b := range spy.busy[1:] {
+	for i, b := range spy.busy[1:3] {
 		if !slices.Equal(b, []string{"ada"}) {
 			t.Errorf("decision %d saw busy %v", i+1, b)
 		}
@@ -165,27 +166,31 @@ func TestSlowRunIsBackgroundedAndRepliesLater(t *testing.T) {
 	spy.mu.Unlock()
 
 	close(release)
-	posts := h.waitPosts(3)
+	posts := h.waitPosts(5)
 	if posts[2] != "ada: drawn: a cat ↩ "+reqID {
 		t.Fatalf("background result %q, want a reply to %s", posts[2], reqID)
 	}
+	// Cleo reacts, then Ada: two bot-to-bot turns (the cap); the result
+	// itself is not counted.
+	if !slices.Equal(posts[3:], []string{"cleo: reply cleo", "ada: reply ada"}) {
+		t.Fatalf("reactions to the result: %v", posts[3:])
+	}
 	h.waitIdle()
 	time.Sleep(30 * time.Millisecond)
-	if _, _, _, _, calls := h.snap(); len(calls) != 3 {
-		t.Fatalf("the background result started a chain: %d calls", len(calls))
+	if _, _, _, _, calls := h.snap(); len(calls) != 5 {
+		t.Fatalf("%d calls, want 5 (max_bot_turns caps the reactions)", len(calls))
 	}
 	_, _, _, typing, _ := h.snap()
-	if typing[len(typing)-1] != "ada: off" && !slices.Contains(typing, "ada: off") {
+	if !slices.Contains(typing, "ada: off") {
 		t.Fatalf("typing never turned off: %v", typing)
 	}
 
 	// Ada's cursor moved to the end of her request's delta: her next turn
 	// sees what happened meanwhile, not the request again.
-	h.o.Handle(h.ctx, h.user("Ada, nice"))
-	calls := h.waitCalls(4)
-	want := "<msg from=\"Cleo\">reply cleo</msg>\n<msg from=\"Alex\">anyone around?</msg>\n<msg from=\"Cleo\">reply cleo</msg>\n<msg from=\"Alex\">Ada, nice</msg>"
-	if calls[3].bot != "ada" || calls[3].delta != want {
-		t.Fatalf("ada's next delta %+v", calls[3])
+	calls := h.waitCalls(5)
+	want := "<msg from=\"Cleo\">reply cleo</msg>\n<msg from=\"Alex\">anyone around?</msg>\n<msg from=\"Cleo\">reply cleo</msg>\n<msg from=\"Cleo\">reply cleo</msg>"
+	if calls[4].bot != "ada" || calls[4].delta != want {
+		t.Fatalf("ada's next delta %+v", calls[4])
 	}
 }
 
