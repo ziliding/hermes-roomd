@@ -90,7 +90,8 @@ prompt. They cover both original failure modes:
 
 - **Under-selection.** `group-question-zh` and `group-question-en` are a
   question to the whole group, where every character should answer, not
-  one.
+  one. Only `addressed_to` and `user_question_pending` are scored: with
+  `"all"`, roomd makes every character owe a reply whatever the plan says.
 - **False "waiting for the user".** `question-in-passing-owed` and
   `question-in-passing-continuation` are a bot's question to the user in
   passing, which must not stop the others.
