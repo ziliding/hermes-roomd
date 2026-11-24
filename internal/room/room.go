@@ -17,6 +17,10 @@
 // max_bot_turns; it never creates obligations to the user. A user message
 // that names a busy bot is steered into its run instead of starting a chain.
 //
+// A room with check-ins on also has a watcher goroutine: once the room has
+// been quiet long enough, it queues a check-in, and the worker asks one bot
+// to start something (see checkin.go).
+//
 // The user's commands (/reset, /explain) are never recorded as conversation.
 // They go through the same worker queue, so they never race a turn, and they
 // are never coalesced away by a later message.
@@ -29,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"regexp"
 	"slices"
 	"strconv"
@@ -129,6 +134,7 @@ type worker struct {
 	botKeys         []string      // this room's cast, stable order
 	notifier        string        // bot key that posts roomd's notices in this room
 	backgroundAfter time.Duration // 0: never hand a run off to the background
+	checkIn         *CheckIn      // nil: no check-ins in this room
 
 	inbox     chan queued
 	held      []queued     // taken from inbox while draining results; handled first (worker goroutine only)
@@ -162,6 +168,7 @@ type RoomSpec struct {
 	// BackgroundAfter hands a run that is still going after this long to the
 	// background. 0 disables it: the room waits for every run.
 	BackgroundAfter time.Duration
+	CheckIn         *CheckIn // nil: no check-ins in this room
 }
 
 type queued struct {
@@ -174,11 +181,13 @@ type queued struct {
 	// floor is free. epoch is the user epoch when it ended: a user message
 	// that arrived since stops any reaction to it.
 	result *job
+	// checkIn is a check-in the watcher queued; epoch is the user epoch then.
+	checkIn *checkInReq
 }
 
 // Options configures New. Each room comes from RoomSpecs; the rooms listed
-// in Rooms (if any) all share Roster, Decider, Bots, Notifier, Memory and
-// BackgroundAfter.
+// in Rooms (if any) all share Roster, Decider, Bots, Notifier, Memory,
+// BackgroundAfter and CheckIn.
 type Options struct {
 	Store         *transcript.Store
 	RoomSpecs     []RoomSpec
@@ -204,6 +213,7 @@ type Options struct {
 	Notifier        string
 	Memory          Memory
 	BackgroundAfter time.Duration
+	CheckIn         *CheckIn
 }
 
 // New builds an orchestrator; call Run to start the room workers.
@@ -218,13 +228,18 @@ func New(o Options) *Orchestrator {
 	specs := append([]RoomSpec{}, o.RoomSpecs...)
 	for _, r := range o.Rooms {
 		specs = append(specs, RoomSpec{ID: r, Roster: o.Roster, Decider: o.Decider, Group: o.Group, Bots: o.Bots, Notifier: o.Notifier,
-			Memory: o.Memory, BackgroundAfter: o.BackgroundAfter})
+			Memory: o.Memory, BackgroundAfter: o.BackgroundAfter, CheckIn: o.CheckIn})
 	}
 	for _, sp := range specs {
 		w := &worker{
 			id: sp.ID, roster: sp.Roster, builder: contextbuild.New(sp.Roster), decider: sp.Decider, group: sp.Group,
 			memory: sp.Memory, bots: map[string]*Bot{}, notifier: sp.Notifier, inbox: make(chan queued, 64),
-			backgroundAfter: sp.BackgroundAfter, busy: map[string]*job{}, noImages: map[string]int64{},
+			backgroundAfter: sp.BackgroundAfter, checkIn: sp.CheckIn, busy: map[string]*job{}, noImages: map[string]int64{},
+		}
+		if c := w.checkIn; c != nil && c.Rand == nil {
+			cc := *c
+			cc.Rand = rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0))
+			w.checkIn = &cc
 		}
 		for _, b := range sp.Bots {
 			w.bots[b.Key] = b
@@ -249,12 +264,20 @@ func or0(d, def time.Duration) time.Duration {
 // every run they are following, exit. A run still going at shutdown is
 // logged and left to Hermes; its result is not posted.
 func (o *Orchestrator) Run(ctx context.Context) {
+	started := o.now()
 	for _, w := range o.rooms {
 		o.wg.Add(1)
 		go func() {
 			defer o.wg.Done()
 			o.work(ctx, w)
 		}()
+		if w.checkIn != nil {
+			o.wg.Add(1)
+			go func() {
+				defer o.wg.Done()
+				o.watchQuiet(ctx, w, started)
+			}()
+		}
 	}
 	<-ctx.Done()
 	o.wg.Wait()
@@ -332,6 +355,9 @@ func (o *Orchestrator) work(ctx context.Context, w *worker) {
 			continue
 		case q.cmd != nil:
 			o.command(ctx, w, q)
+			continue
+		case q.checkIn != nil:
+			o.runCheckIn(ctx, w, q)
 			continue
 		}
 		// Results that ended before this message are posted first (with no

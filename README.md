@@ -242,6 +242,32 @@ sends them.
   The extra allowance lasts until you next speak, and your message stops
   the round like any chain.
 
+### Check-ins (optional)
+
+With `check_in.enabled`, a room that has been quiet for a while comes back
+to life on its own: one bot is asked to start something, the way a friend
+would text a group chat.
+
+- **When:** once nobody (you or a bot) has written for `after` (default
+  3h). Quiet counts from the newest message, your last message or command,
+  the last check-in, or roomd's start, whichever is latest. A restart
+  therefore never sets the bots off at once.
+- **Randomness:** `jitter` moves each check-in up to that much earlier or
+  later, drawn once per quiet spell.
+- **Quiet hours:** no check-in starts inside `quiet_hours` (e.g.
+  `"23:00-07:00"`, read in `timezone`). One that falls due inside them waits
+  for their end, plus a random delay of at most `jitter`.
+- **Who:** a random free bot, not the one that spoke last. Its run input says
+  how long the chat has been quiet and the local time, and lets it reply
+  `[SILENT]` if nothing comes to mind. The instruction goes in the user
+  message, never the system prompt.
+- **Then:** the others may react, as bot-to-bot continuation under
+  `max_bot_turns` (the opener isn't counted). Your message stops it like any
+  chain, and a check-in queued before your message is dropped.
+- **Unanswered:** after `max_unanswered` check-ins in a row (default 2; `0`
+  means no limit) with no message or command from you in between, roomd
+  waits for you. The count lives in memory, so a restart clears it.
+
 ### Group memory (optional)
 
 With `memory.enabled`, roomd keeps a Hindsight bank of past group chats
@@ -316,6 +342,9 @@ deploy/roomd.service        systemd user unit
   - `blurb`.
 - **`router`:** `enabled`, `base_url` (including `/v1`), `model`, `key_env`,
   `timeout`, `window`, `json_mode`, `log_file`.
+- **`check_in`:** `enabled`, `after`, `jitter`, `quiet_hours`, `timezone`,
+  `max_unanswered` (see [Check-ins](#check-ins-optional)). `timezone`
+  defaults to the host's local time, which is UTC in Docker.
 - **`memory`:**
   - `enabled`;
   - `api_url`: Hindsight, without `/v1`;
@@ -347,6 +376,7 @@ rooms:
     background_after: 0s           # always wait for a bot's run here
     rules_file: rules/lounge.md
     memory: { bank_id: roomd-lounge, retain: { idle_minutes: 10 } }
+    check_in: { enabled: true, after: 90m }
 ```
 
 - **Cast:** turns, the router, `!explain`, `!reset`, `!continue`, memory
@@ -354,6 +384,9 @@ rooms:
 - **Listener:** roomd runs one `/sync` loop per distinct listener. A listener
   only has to be joined to its own rooms. If the top-level listener isn't in
   a room's cast, that room uses its first cast bot.
+- **Check-ins:** a room's `check_in` can override any of its keys; the rest
+  come from the top level. A room can turn check-ins on while the top level
+  leaves them off, or the other way round.
 - **Memory:** rooms that name the same bank share it.
   - A room can override `recall.enabled`, `retain.enabled`,
     `retain.idle_minutes` and `retain.min_messages`.
@@ -492,11 +525,12 @@ internal/silence      silence-marker detection
 internal/turns        Decider interface and the plain turn rules
 internal/router       LLM router (a turns.Decider that falls back to the rules)
 internal/commands     !reset, !explain and !continue parsing
+internal/checkin      check-in schedule: quiet hours, jitter, the opener's instruction
 internal/media        inline images and MEDIA: tags out of replies; long-text splitting
 internal/hermes       Runs API client (start, poll, steer, stop); hermestest is a fake server
 internal/hindsight    Hindsight HTTP client (recall, retain, banks)
 internal/memory       recall block and once-per-conversation retain
-internal/room         the orchestrator: one worker per room, the turn chain, background runs
+internal/room         the orchestrator: one worker per room, the turn chain, background runs, check-ins
 ```
 
 ## License

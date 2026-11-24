@@ -14,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	_ "time/tzdata" // check_in.timezone works even where the host has no zoneinfo
 
 	"github.com/ziliding/hermes-roomd/internal/config"
 	"github.com/ziliding/hermes-roomd/internal/hermes"
@@ -200,6 +201,12 @@ func buildRooms(cfg *config.Config, store *transcript.Store, posters map[string]
 		spec := room.RoomSpec{ID: rc.ID, Roster: r, Decider: decider, Group: roster.NewGroupMatcher(cfg.GroupWords),
 			Bots: bots, Notifier: rc.Listener,
 			BackgroundAfter: time.Duration(*rc.BackgroundAfter)}
+		if ci := rc.CheckInConfig; ci.Enabled {
+			spec.CheckIn = &room.CheckIn{Schedule: ci.Schedule, MaxUnanswered: ci.MaxUnanswered,
+				Rand: rand.New(rand.NewPCG(s^0x5bd1e995, s))}
+			log.Info("room check-ins", "room", rc.Label(), "after", ci.Schedule.After, "jitter", ci.Schedule.Jitter,
+				"quiet_hours", ci.Schedule.Quiet.String(), "timezone", ci.Schedule.Loc.String(), "max_unanswered", ci.MaxUnanswered)
+		}
 
 		if mc := cfg.Memory; mc.Enabled {
 			eff := cfg.MemoryFor(rc)

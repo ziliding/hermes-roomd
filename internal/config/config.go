@@ -16,6 +16,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/ziliding/hermes-roomd/internal/checkin"
 	"github.com/ziliding/hermes-roomd/internal/roster"
 )
 
@@ -102,6 +103,33 @@ type MemoryRecall struct {
 	MinScore *float64 `yaml:"min_score"`
 }
 
+// CheckIn configures check-ins: once a room has been quiet for after, one
+// bot is asked to start something. It appears at the top level and in a
+// room; each field a room leaves out takes the top level's.
+type CheckIn struct {
+	Enabled *bool     `yaml:"enabled"` // default false
+	After   *Duration `yaml:"after"`   // quiet time before a check-in (default 3h)
+	// Jitter moves each check-in by a random amount up to this much, earlier
+	// or later (default 0).
+	Jitter *Duration `yaml:"jitter"`
+	// QuietHours ("23:00-07:00") is a daily span when no check-in starts; one
+	// that falls due inside it waits for its end. "" (default): none.
+	QuietHours *string `yaml:"quiet_hours"`
+	// Timezone is the IANA zone quiet_hours are read in (default: the host's
+	// local time, which is usually UTC in a container).
+	Timezone *string `yaml:"timezone"`
+	// MaxUnanswered stops check-ins after this many in a row with no user
+	// message in between (default 2; 0: no limit).
+	MaxUnanswered *int `yaml:"max_unanswered"`
+}
+
+// CheckInConfig is the check-in configuration in effect for one room.
+type CheckInConfig struct {
+	Enabled       bool
+	Schedule      checkin.Schedule
+	MaxUnanswered int
+}
+
 // RetainMode is how a finished conversation is written to the group bank.
 type RetainMode string
 
@@ -153,8 +181,10 @@ type Room struct {
 	BackgroundAfter *Duration  `yaml:"background_after"`
 	RulesFile       string     `yaml:"rules_file"` // this room's group rules (default: group_rules_file)
 	Memory          RoomMemory `yaml:"memory"`
+	CheckIn         CheckIn    `yaml:"check_in"` // overrides the top-level check_in
 
-	Rules string `yaml:"-"` // contents of the effective rules file
+	Rules         string        `yaml:"-"` // contents of the effective rules file
+	CheckInConfig CheckInConfig `yaml:"-"` // the effective check_in, resolved by validation
 }
 
 // RoomMemory overrides the memory settings for one room. memory.enabled
@@ -279,6 +309,7 @@ type Config struct {
 	Bots      map[string]*Bot `yaml:"bots"`
 	Router    Router          `yaml:"router"`
 	Memory    Memory          `yaml:"memory"`
+	CheckIn   CheckIn         `yaml:"check_in"`
 
 	GroupRules string `yaml:"-"` // contents of GroupRulesFile
 }
@@ -301,6 +332,11 @@ const (
 	DefaultRetainMinMessages = 4
 	DefaultRetainTimeout     = 2 * time.Minute
 	DefaultRetainMode        = RetainSummary
+
+	DefaultCheckInAfter         = 3 * time.Hour
+	DefaultCheckInMaxUnanswered = 2
+	// MinCheckInAfter keeps a typo ("3m" for "3h") from making the bots chatter.
+	MinCheckInAfter = 10 * time.Minute
 )
 
 var botKeyRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_]{0,31}$`)
@@ -429,6 +465,25 @@ func (c *Config) applyDefaults() {
 			}
 		}
 	}
+	ci := &c.CheckIn
+	ci.Enabled = orDefault(ci.Enabled, false)
+	ci.After = orDefault(ci.After, Duration(DefaultCheckInAfter))
+	ci.Jitter = orDefault(ci.Jitter, 0)
+	ci.QuietHours = orDefault(ci.QuietHours, "")
+	ci.Timezone = orDefault(ci.Timezone, "")
+	ci.MaxUnanswered = orDefault(ci.MaxUnanswered, DefaultCheckInMaxUnanswered)
+	for _, r := range c.Rooms {
+		if r == nil {
+			continue
+		}
+		rc := &r.CheckIn
+		rc.Enabled = inherit(rc.Enabled, ci.Enabled)
+		rc.After = inherit(rc.After, ci.After)
+		rc.Jitter = inherit(rc.Jitter, ci.Jitter)
+		rc.QuietHours = inherit(rc.QuietHours, ci.QuietHours)
+		rc.Timezone = inherit(rc.Timezone, ci.Timezone)
+		rc.MaxUnanswered = inherit(rc.MaxUnanswered, ci.MaxUnanswered)
+	}
 	if c.Router.Timeout == 0 {
 		c.Router.Timeout = DefaultRouterTimeout
 	}
@@ -468,6 +523,20 @@ func (c *Config) applyDefaults() {
 	if m.Retain.Timeout == 0 {
 		m.Retain.Timeout = DefaultRetainTimeout
 	}
+}
+
+func orDefault[T any](p *T, def T) *T {
+	if p == nil {
+		return &def
+	}
+	return p
+}
+
+func inherit[T any](p, top *T) *T {
+	if p == nil {
+		return top
+	}
+	return p
 }
 
 // BotKeys returns bot keys sorted, so iteration (system prompts, roster) is stable.
@@ -579,6 +648,7 @@ func (c *Config) validate(lookupEnv func(string) (string, bool)) error {
 		b.Hermes.Key = resolveEnv(lookupEnv, b.Hermes.KeyEnv, "bots."+key+".hermes.key_env", fail)
 	}
 	c.validateRooms(fail)
+	c.validateCheckIn(fail)
 	if c.Router.Enabled {
 		if !strings.HasPrefix(c.Router.BaseURL, "http://") && !strings.HasPrefix(c.Router.BaseURL, "https://") {
 			fail("router.base_url must be an http(s) URL")
@@ -632,6 +702,52 @@ func (c *Config) validateRooms(fail func(string, ...any)) {
 			fail("%s: memory.retain.idle_minutes and min_messages must be positive", where)
 		}
 	}
+}
+
+// validateCheckIn resolves each room's check_in. A room that inherits every
+// field shares the top level's, so its errors are reported once.
+func (c *Config) validateCheckIn(fail func(string, ...any)) {
+	top := c.CheckIn.resolve("check_in", fail)
+	for _, r := range c.Rooms {
+		switch {
+		case r == nil:
+		case r.CheckIn == c.CheckIn:
+			r.CheckInConfig = top
+		default:
+			r.CheckInConfig = r.CheckIn.resolve("room "+r.Label()+": check_in", fail)
+		}
+	}
+}
+
+// resolve validates a check_in whose fields are all set (defaults applied)
+// and returns it in effect. Nothing is checked when it is off.
+func (ci CheckIn) resolve(where string, fail func(string, ...any)) CheckInConfig {
+	out := CheckInConfig{Enabled: *ci.Enabled, MaxUnanswered: *ci.MaxUnanswered}
+	if !out.Enabled {
+		return CheckInConfig{}
+	}
+	after, jitter := time.Duration(*ci.After), time.Duration(*ci.Jitter)
+	if after < MinCheckInAfter {
+		fail("%s.after must be at least %v", where, MinCheckInAfter)
+	}
+	if jitter < 0 || jitter >= after {
+		fail("%s.jitter must be 0 or more, and shorter than after (%v)", where, after)
+	}
+	quiet, err := checkin.ParseWindow(*ci.QuietHours)
+	if err != nil {
+		fail("%s.quiet_hours: %v", where, err)
+	}
+	loc := time.Local
+	if tz := strings.TrimSpace(*ci.Timezone); tz != "" {
+		if loc, err = time.LoadLocation(tz); err != nil {
+			fail("%s.timezone: %v", where, err)
+		}
+	}
+	if out.MaxUnanswered < 0 {
+		fail("%s.max_unanswered must be 0 (no limit) or more", where)
+	}
+	out.Schedule = checkin.Schedule{After: after, Jitter: jitter, Quiet: quiet, Loc: loc}
+	return out
 }
 
 // Duration is a time.Duration ("20s", "1m30s") that also accepts a bare 0,

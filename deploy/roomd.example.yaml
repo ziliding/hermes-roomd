@@ -15,6 +15,7 @@ rooms:                                   # room IDs from Room settings → Advan
   #   max_bot_turns: 3
   #   background_after: 0s               # this room always waits for a bot's run
   #   rules_file: rules/lounge.md        # this room's group rules (default: group_rules_file)
+  #   check_in: { enabled: true, after: 90m }   # any check_in key (below); the rest come from the top level
   #   memory:                            # needs memory.enabled: true (below)
   #     bank_id: roomd-lounge            # this room's own bank: nothing from other rooms comes up here
   #     recall: { enabled: true }
@@ -118,3 +119,15 @@ memory:
     #   base_url: https://api.venice.ai/api/v1
     #   model: z-ai-glm-5-3          # infrequent task: a stronger model than the per-turn router is affordable
     #   key_env: ROOMD_SUMMARY_KEY
+
+# Check-ins (optional): once a room has been quiet (nobody has written) for
+# `after`, one bot is asked to start something: a thought, news, a question.
+# The others may react, under max_bot_turns. A user message stops it like any
+# chain. A room can override any of these keys in its own check_in.
+check_in:
+  enabled: false
+  after: 3h                          # quiet time before a check-in (at least 10m)
+  jitter: 30m                        # each check-in moves up to this much earlier or later; 0 = exactly `after`
+  quiet_hours: "23:00-07:00"         # no check-in starts in this daily span; one due inside it waits for its end. "" = none
+  timezone: America/New_York         # IANA zone for quiet_hours (default: the host's local time; UTC in Docker)
+  max_unanswered: 2                  # stop after this many check-ins in a row with no user message; 0 = no limit

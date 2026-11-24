@@ -61,6 +61,7 @@ type harnessOpts struct {
 	typingEvery     time.Duration
 	decider         func(bots []string) turns.Decider // default: the plain rules
 	files           *media.Files
+	checkIn         *CheckIn
 }
 
 // startServer starts the fake Runs server; runs follow h.reply.
@@ -219,6 +220,7 @@ func newHarnessWith(t *testing.T, ho harnessOpts, reply func(bot string, n int) 
 		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 		PollInterval: 2 * time.Millisecond, RunTimeout: ho.runTimeout,
 		TypingEvery: or0(ho.typingEvery, time.Hour), BackgroundAfter: ho.backgroundAfter, Files: ho.files,
+		CheckIn: ho.checkIn,
 	})
 	return h
 }
