@@ -32,6 +32,14 @@ type Message struct {
 	Control bool
 	// Image is set for an m.image; Body is then its caption ("" for none).
 	Image *ImageRef
+	// Reaction is set for an m.reaction (an annotation); Body is then "".
+	Reaction *Reaction
+}
+
+// Reaction is an m.reaction's annotation: Key on the event Target.
+type Reaction struct {
+	Target string // the event reacted to
+	Key    string // the emoji (or text) as sent
 }
 
 // ImageRef is an image message's media.
@@ -196,9 +204,9 @@ func CheckRooms(ctx context.Context, cli *mautrix.Client, rooms []string) error 
 	return errors.Join(errs...)
 }
 
-// Listen syncs on cli, filtered to rooms, and calls handle for every text
-// message sent after startAt. Edits (m.replace) and non-text msgtypes are
-// dropped. It blocks until ctx is done.
+// Listen syncs on cli, filtered to rooms, and calls handle for every text or
+// image message and every reaction sent after startAt. Edits (m.replace) and
+// other msgtypes are dropped. It blocks until ctx is done.
 func Listen(ctx context.Context, cli *mautrix.Client, rooms []string, startAt time.Time, log *slog.Logger, handle func(Message)) error {
 	want := map[id.RoomID]bool{}
 	roomIDs := make([]id.RoomID, 0, len(rooms))
@@ -210,7 +218,7 @@ func Listen(ctx context.Context, cli *mautrix.Client, rooms []string, startAt ti
 	syncer.FilterJSON = &mautrix.Filter{
 		Room: &mautrix.RoomFilter{
 			Rooms:    roomIDs,
-			Timeline: &mautrix.FilterPart{Types: []event.Type{event.EventMessage, event.EventEncrypted}, Limit: 50},
+			Timeline: &mautrix.FilterPart{Types: []event.Type{event.EventMessage, event.EventReaction, event.EventEncrypted}, Limit: 50},
 		},
 		Presence:    &mautrix.FilterPart{NotTypes: []event.Type{{Type: "*"}}},
 		AccountData: &mautrix.FilterPart{NotTypes: []event.Type{{Type: "*"}}},
@@ -237,6 +245,17 @@ func Listen(ctx context.Context, cli *mautrix.Client, rooms []string, startAt ti
 		l.Debug("received", "chars", len(msg.Body))
 		handle(msg)
 	})
+	syncer.OnEventType(event.EventReaction, func(_ context.Context, evt *event.Event) {
+		if !want[evt.RoomID] || evt.Timestamp < startMS {
+			return
+		}
+		msg, ok := toReaction(evt)
+		if !ok {
+			return
+		}
+		log.Debug("reaction received", "room", evt.RoomID, "sender", evt.Sender, "event", evt.ID, "key", msg.Reaction.Key)
+		handle(msg)
+	})
 	syncer.OnSync(func(_ context.Context, resp *mautrix.RespSync, since string) bool {
 		log.Debug("sync", "joined_rooms", len(resp.Rooms.Join), "invited_rooms", len(resp.Rooms.Invite), "initial", since == "")
 		return true
@@ -257,6 +276,21 @@ func Listen(ctx context.Context, cli *mautrix.Client, rooms []string, startAt ti
 		return nil
 	}
 	return err
+}
+
+// toReaction reads an m.reaction annotation.
+func toReaction(evt *event.Event) (Message, bool) {
+	c := evt.Content.AsReaction()
+	if c == nil || c.RelatesTo.Type != event.RelAnnotation || c.RelatesTo.EventID == "" || c.RelatesTo.Key == "" {
+		return Message{}, false
+	}
+	return Message{
+		RoomID:   string(evt.RoomID),
+		EventID:  string(evt.ID),
+		Sender:   string(evt.Sender),
+		TS:       evt.Timestamp,
+		Reaction: &Reaction{Target: string(c.RelatesTo.EventID), Key: c.RelatesTo.Key},
+	}, true
 }
 
 func toMessage(evt *event.Event) (Message, bool) {

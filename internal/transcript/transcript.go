@@ -235,6 +235,18 @@ func (s *Store) LastFrom(ctx context.Context, roomID string, senders []string) (
 	return sender, err
 }
 
+// SenderOf returns the sender of the recorded event eventID in room, or ""
+// if it isn't recorded there.
+func (s *Store) SenderOf(ctx context.Context, roomID, eventID string) (string, error) {
+	var sender string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT sender FROM messages WHERE room_id = ? AND event_id = ?`, roomID, eventID).Scan(&sender)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return sender, err
+}
+
 // Reset starts fresh Hermes sessions for bots in room, in one transaction:
 // every bot's generation goes up by one (a bot never called counts as
 // generation 1, so it moves to 2), and every cursor moves to upTo, so the

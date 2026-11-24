@@ -200,7 +200,7 @@ func buildRooms(cfg *config.Config, store *transcript.Store, posters map[string]
 		}
 		spec := room.RoomSpec{ID: rc.ID, Roster: r, Decider: decider, Group: roster.NewGroupMatcher(cfg.GroupWords),
 			Bots: bots, Notifier: rc.Listener,
-			BackgroundAfter: time.Duration(*rc.BackgroundAfter)}
+			BackgroundAfter: time.Duration(*rc.BackgroundAfter), MaxBotTurns: rc.MaxBotTurns}
 		if ci := rc.CheckInConfig; ci.Enabled {
 			spec.CheckIn = &room.CheckIn{Schedule: ci.Schedule, MaxUnanswered: ci.MaxUnanswered,
 				Rand: rand.New(rand.NewPCG(s^0x5bd1e995, s))}

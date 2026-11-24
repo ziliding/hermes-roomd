@@ -240,7 +240,14 @@ sends them.
   turn, even if the router thinks the exchange is over (it can still stay
   silent); after that the usual rules apply, so the round can end early.
   The extra allowance lasts until you next speak, and your message stops
-  the round like any chain.
+  the round like any chain. If that first bot stays silent, a notice says
+  so.
+- **The ⏩ button:** when the bots stop because they reached the cap, the
+  room's listener puts a ⏩ reaction on the last bot message. Click it
+  (add ⏩ yourself) to run `!continue`. Any bot message works, and an old
+  button still continues from the latest message. Other reactions, and
+  reactions from anyone but you, do nothing. No ⏩ appears when the bots
+  wound down on their own before the cap.
 
 ### Check-ins (optional)
 

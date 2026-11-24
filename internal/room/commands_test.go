@@ -2,6 +2,7 @@ package room
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -296,5 +297,93 @@ func TestContinueOverridesAnEmptyFirstPlan(t *testing.T) {
 	h.runCmd(h.user("!continue 5"))
 	if got := h.speakers(); len(got) != 2 || got[0] != "ada" || got[1] != "cleo" {
 		t.Fatalf("speakers %v, want [ada cleo]", got)
+	}
+}
+
+func (h *harness) latestEvent() string {
+	h.t.Helper()
+	e, err := h.o.store.Since(context.Background(), roomID, 0, 1)
+	if err != nil || len(e) != 1 {
+		h.t.Fatalf("latest entry: %v %v", e, err)
+	}
+	return e[0].EventID
+}
+
+func reaction(sender, target, key string) matrixio.Message {
+	evn++
+	return matrixio.Message{RoomID: roomID, EventID: fmt.Sprintf("$r%d", evn), Sender: sender,
+		Reaction: &matrixio.Reaction{Target: target, Key: key}}
+}
+
+// The bots stop at the cap: the notifier offers ⏩ on the last bot message,
+// and the user clicking it runs !continue.
+func TestContinueButton(t *testing.T) {
+	h := newHarness(t, 1, func(bot string, n int) string { return "reply " + bot })
+	h.runOne("Cleo, hi") // cleo owes the reply; ada continues once and hits the cap
+	capped := h.latestEvent()
+	if want := "ada: " + capped + " " + ContinueButton; len(h.reacts) != 1 || h.reacts[0] != want {
+		t.Fatalf("reacts %v, want [%s]", h.reacts, want)
+	}
+
+	before := h.latestSeq()
+	h.runCmd(reaction("@alex:z", capped, ContinueButton+"️")) // with the variation selector
+	if got := h.speakers(); len(got) != 3 || got[2] != "cleo" {
+		t.Fatalf("speakers %v, want cleo to carry on", got)
+	}
+	if h.latestSeq() != before+1 {
+		t.Fatalf("seq %d → %d: the reaction was recorded or the reply wasn't", before, h.latestSeq())
+	}
+	if want := "ada: " + h.latestEvent() + " " + ContinueButton; len(h.reacts) != 2 || h.reacts[1] != want {
+		t.Fatalf("button not offered again at the cap: %v", h.reacts)
+	}
+
+	// An old button continues from the latest message, not from the old one.
+	h.runCmd(reaction("@alex:z", capped, ContinueButton))
+	if got := h.speakers(); len(got) != 4 || got[3] != "ada" {
+		t.Fatalf("old button: speakers %v, want ada after cleo", got)
+	}
+}
+
+func TestContinueButtonIgnoresOtherReactions(t *testing.T) {
+	h := newHarness(t, 1, func(bot string, n int) string { return "reply " + bot })
+	h.runOne("Cleo, hi")
+	botMsg := h.latestEvent()
+	h.o.Handle(context.Background(), h.user("a note of mine"))
+	<-h.o.rooms[roomID].inbox
+	userMsg := h.latestEvent()
+	before := h.latestSeq()
+	for _, m := range []matrixio.Message{
+		reaction("@ada:z", botMsg, ContinueButton),      // the notifier's own button echoing back
+		reaction("@stranger:z", botMsg, ContinueButton), // someone else
+		reaction("@alex:z", botMsg, "👍"),                // another emoji
+		reaction("@alex:z", userMsg, ContinueButton),    // on the user's own message
+		reaction("@alex:z", "$unknown", ContinueButton), // on a message roomd never recorded
+	} {
+		h.o.Handle(context.Background(), m)
+		if n := len(h.o.rooms[roomID].inbox); n != 0 {
+			t.Fatalf("%s's %s on %s queued %d items", m.Sender, m.Reaction.Key, m.Reaction.Target, n)
+		}
+	}
+	if h.latestSeq() != before {
+		t.Fatal("a reaction was recorded as conversation")
+	}
+}
+
+// No button when the bots wound down before the cap: a bot stayed silent.
+func TestNoContinueButtonBeforeTheCap(t *testing.T) {
+	h := newHarness(t, 2, func(bot string, n int) string {
+		if bot == "ada" {
+			return "[SILENT]"
+		}
+		return "reply " + bot
+	})
+	h.runOne("Cleo, hi") // cleo replies; ada has nothing to add
+	if len(h.reacts) != 0 {
+		t.Fatalf("button offered before the cap: %v", h.reacts)
+	}
+	// !continue whose first bot stays silent says so instead of doing nothing.
+	h.runCmd(h.user("!continue"))
+	if len(h.notices) != 1 || !strings.Contains(h.notices[0], "Ada had nothing to add") {
+		t.Fatalf("notices %v", h.notices)
 	}
 }

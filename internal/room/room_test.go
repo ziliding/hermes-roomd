@@ -216,7 +216,7 @@ func newHarnessWith(t *testing.T, ho harnessOpts, reply func(bot string, n int) 
 	}
 	h.o = New(Options{
 		Store: store, Roster: r, Decider: decider, Group: roster.NewGroupMatcher(roster.DefaultGroupWords),
-		Bots: bots, Rooms: []string{roomID}, MaxDeltaLines: 40,
+		Bots: bots, Rooms: []string{roomID}, MaxDeltaLines: 40, MaxBotTurns: ho.maxTurns,
 		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 		PollInterval: 2 * time.Millisecond, RunTimeout: ho.runTimeout,
 		TypingEvery: or0(ho.typingEvery, time.Hour), BackgroundAfter: ho.backgroundAfter, Files: ho.files,

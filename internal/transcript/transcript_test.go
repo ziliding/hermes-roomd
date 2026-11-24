@@ -75,3 +75,24 @@ func TestMediaColumnsAndMigration(t *testing.T) {
 		}
 	}
 }
+
+func TestSenderOf(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.Append(ctx, Entry{RoomID: "!a", EventID: "$1", Sender: "@ada:z", Body: "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct{ room, event, want string }{
+		{"!a", "$1", "@ada:z"},
+		{"!a", "$2", ""}, // not recorded
+		{"!b", "$1", ""}, // another room
+	} {
+		if got, err := s.SenderOf(ctx, tt.room, tt.event); err != nil || got != tt.want {
+			t.Errorf("SenderOf(%s, %s) = %q, %v; want %q", tt.room, tt.event, got, err, tt.want)
+		}
+	}
+}

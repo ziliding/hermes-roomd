@@ -254,3 +254,29 @@ func TestDownloadLimit(t *testing.T) {
 		t.Fatal("not an mxc URI must fail")
 	}
 }
+
+func TestToReaction(t *testing.T) {
+	parse := func(content string) *event.Event {
+		evt := &event.Event{Type: event.EventReaction, RoomID: "!r:z", ID: "$x", Sender: "@alex:z", Timestamp: 7}
+		if err := json.Unmarshal([]byte(content), &evt.Content); err != nil {
+			t.Fatal(err)
+		}
+		evt.Content.ParseRaw(evt.Type)
+		return evt
+	}
+	m, ok := toReaction(parse(`{"m.relates_to":{"rel_type":"m.annotation","event_id":"$b1","key":"⏩"}}`))
+	if !ok || m.Reaction == nil || *m.Reaction != (Reaction{Target: "$b1", Key: "⏩"}) ||
+		m.Sender != "@alex:z" || m.RoomID != "!r:z" || m.EventID != "$x" || m.Body != "" {
+		t.Fatalf("reaction = %+v ok=%v", m, ok)
+	}
+	for _, bad := range []string{
+		`{}`,
+		`{"m.relates_to":{"rel_type":"m.annotation","event_id":"$b1"}}`,
+		`{"m.relates_to":{"rel_type":"m.annotation","key":"⏩"}}`,
+		`{"m.relates_to":{"rel_type":"m.reference","event_id":"$b1","key":"⏩"}}`,
+	} {
+		if m, ok := toReaction(parse(bad)); ok {
+			t.Errorf("toReaction(%s) = %+v, want dropped", bad, m)
+		}
+	}
+}

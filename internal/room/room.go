@@ -103,6 +103,11 @@ const (
 	DefaultTypingEvery   = 25 * time.Second
 	// SteerAck is the reaction a bot puts on a message steered into its run.
 	SteerAck = "✓"
+	// ContinueButton is the reaction that works as a "continue" button: the
+	// room's notifier puts it on the last bot message when the bots stop at
+	// the bot-to-bot cap, and the user adding it to a bot message runs
+	// /continue (from the latest message, whichever one it is on).
+	ContinueButton = "⏩"
 )
 
 // Orchestrator owns all configured rooms.
@@ -134,6 +139,7 @@ type worker struct {
 	botKeys         []string      // this room's cast, stable order
 	notifier        string        // bot key that posts roomd's notices in this room
 	backgroundAfter time.Duration // 0: never hand a run off to the background
+	maxBotTurns     int           // the decider's bot-to-bot cap; 0: unknown, so no continue button
 	checkIn         *CheckIn      // nil: no check-ins in this room
 
 	inbox     chan queued
@@ -168,7 +174,10 @@ type RoomSpec struct {
 	// BackgroundAfter hands a run that is still going after this long to the
 	// background. 0 disables it: the room waits for every run.
 	BackgroundAfter time.Duration
-	CheckIn         *CheckIn // nil: no check-ins in this room
+	// MaxBotTurns is the bot-to-bot cap the Decider enforces. When the bots
+	// stop at it, the notifier offers ContinueButton. 0: never offered.
+	MaxBotTurns int
+	CheckIn     *CheckIn // nil: no check-ins in this room
 }
 
 type queued struct {
@@ -187,7 +196,7 @@ type queued struct {
 
 // Options configures New. Each room comes from RoomSpecs; the rooms listed
 // in Rooms (if any) all share Roster, Decider, Bots, Notifier, Memory,
-// BackgroundAfter and CheckIn.
+// BackgroundAfter, MaxBotTurns and CheckIn.
 type Options struct {
 	Store         *transcript.Store
 	RoomSpecs     []RoomSpec
@@ -213,6 +222,7 @@ type Options struct {
 	Notifier        string
 	Memory          Memory
 	BackgroundAfter time.Duration
+	MaxBotTurns     int
 	CheckIn         *CheckIn
 }
 
@@ -228,13 +238,13 @@ func New(o Options) *Orchestrator {
 	specs := append([]RoomSpec{}, o.RoomSpecs...)
 	for _, r := range o.Rooms {
 		specs = append(specs, RoomSpec{ID: r, Roster: o.Roster, Decider: o.Decider, Group: o.Group, Bots: o.Bots, Notifier: o.Notifier,
-			Memory: o.Memory, BackgroundAfter: o.BackgroundAfter, CheckIn: o.CheckIn})
+			Memory: o.Memory, BackgroundAfter: o.BackgroundAfter, MaxBotTurns: o.MaxBotTurns, CheckIn: o.CheckIn})
 	}
 	for _, sp := range specs {
 		w := &worker{
 			id: sp.ID, roster: sp.Roster, builder: contextbuild.New(sp.Roster), decider: sp.Decider, group: sp.Group,
 			memory: sp.Memory, bots: map[string]*Bot{}, notifier: sp.Notifier, inbox: make(chan queued, 64),
-			backgroundAfter: sp.BackgroundAfter, checkIn: sp.CheckIn, busy: map[string]*job{}, noImages: map[string]int64{},
+			backgroundAfter: sp.BackgroundAfter, maxBotTurns: sp.MaxBotTurns, checkIn: sp.CheckIn, busy: map[string]*job{}, noImages: map[string]int64{},
 		}
 		if c := w.checkIn; c != nil && c.Rand == nil {
 			cc := *c
@@ -295,6 +305,10 @@ func (o *Orchestrator) Handle(ctx context.Context, m matrixio.Message) {
 		o.log.Debug("dropped roomd's own notice", "room", m.RoomID, "event", m.EventID)
 		return
 	}
+	if m.Reaction != nil {
+		o.react(ctx, w, m)
+		return
+	}
 	if m.Sender == w.roster.User().MXID && m.Image == nil {
 		if cmd, ok := commands.Parse(m.Body); ok {
 			o.enqueueCommand(ctx, w, m, cmd)
@@ -318,6 +332,31 @@ func (o *Orchestrator) Handle(ctx context.Context, m matrixio.Message) {
 		// the newest queued user message still triggers.
 		o.log.Warn("room inbox full; message recorded without its own trigger", "room", m.RoomID)
 	}
+}
+
+// react handles a reaction. Only one does anything: the user putting
+// ContinueButton on a bot's message, which runs /continue. Reactions are
+// never conversation and are not recorded.
+func (o *Orchestrator) react(ctx context.Context, w *worker, m matrixio.Message) {
+	if m.Sender != w.roster.User().MXID || !isContinueButton(m.Reaction.Key) {
+		return
+	}
+	sender, err := o.store.SenderOf(ctx, w.id, m.Reaction.Target)
+	if err != nil {
+		o.log.Error("reading the reacted-to message", "room", w.id, "event", m.Reaction.Target, "err", err)
+		return
+	}
+	if p, ok := w.roster.ByMXID(sender); !ok || p == nil || !p.IsBot {
+		o.log.Debug("continue button on a message that isn't a bot's; ignored", "room", w.id, "event", m.Reaction.Target)
+		return
+	}
+	o.enqueueCommand(ctx, w, m, commands.Command{Kind: commands.Continue})
+}
+
+// isContinueButton reports whether key is ContinueButton, with or without
+// the emoji variation selector some clients add.
+func isContinueButton(key string) bool {
+	return strings.TrimSuffix(key, "\ufe0f") == ContinueButton
 }
 
 // enqueueCommand queues a user command without recording it. Like any user
@@ -537,6 +576,10 @@ func (o *Orchestrator) continueChat(ctx context.Context, w *worker, q queued) {
 		return
 	}
 	w.state = turns.State{LastBot: p.Key, Cap: n}
+	// A bot that hands its run to the background replies to the message the
+	// round picks up from, not to the command (or reaction) that asked.
+	req := matrixio.Message{RoomID: w.id, EventID: latest[0].EventID, Sender: latest[0].Sender, Body: latest[0].Body,
+		FormattedBody: latest[0].FormattedBody}
 	trig := o.botTrigger(w, p.Key, latest[0].Body, false)
 	st := w.state
 	st.Busy = w.busyBots()
@@ -561,7 +604,34 @@ func (o *Orchestrator) continueChat(ctx context.Context, w *worker, q queued) {
 		o.notice(ctx, w, "!continue: no other character is free to carry on right now.")
 		return
 	}
-	o.turns(ctx, w, q.epoch, q.msg, plan, nil)
+	if o.turns(ctx, w, q.epoch, req, plan, nil) == 0 && w.userEpoch.Load() == q.epoch && ctx.Err() == nil {
+		// The first bot stayed silent (or failed): say so, or the command
+		// looks ignored.
+		o.notice(ctx, w, "!continue: "+display(w, plan[0])+" had nothing to add.")
+	}
+}
+
+// offerContinue puts the continue button on the latest message, from the
+// room's notifier, when that message is a bot's and the user hasn't spoken
+// since epoch.
+func (o *Orchestrator) offerContinue(ctx context.Context, w *worker, epoch int64) {
+	if w.userEpoch.Load() != epoch {
+		return
+	}
+	latest, err := o.store.Since(ctx, w.id, 0, 1)
+	if err != nil || len(latest) == 0 {
+		return
+	}
+	if p, ok := w.roster.ByMXID(latest[0].Sender); !ok || p == nil || !p.IsBot {
+		return
+	}
+	bot, ok := w.bots[w.notifier]
+	if !ok {
+		return
+	}
+	if err := bot.Poster.React(ctx, w.id, latest[0].EventID, ContinueButton); err != nil {
+		o.log.Error("offering the continue button", "room", w.id, "event", latest[0].EventID, "err", err)
+	}
 }
 
 // notice posts roomd's own status text as the room's notifier (its listener).
@@ -671,8 +741,10 @@ func (o *Orchestrator) chain(ctx context.Context, w *worker, q queued) {
 // set of bots that still owe the user a reply (nil after a background
 // result). req is the message that started it all: a bot that hands its run
 // to the background replies to it. Between two turns, background results
-// that ended meanwhile are posted and become the latest event.
-func (o *Orchestrator) turns(ctx context.Context, w *worker, epoch int64, req matrixio.Message, plan, owed []string) {
+// that ended meanwhile are posted and become the latest event. When the bots
+// stop at the bot-to-bot cap, the notifier offers the continue button. It
+// returns how many turns a bot took (a reply or a hand-off).
+func (o *Orchestrator) turns(ctx context.Context, w *worker, epoch int64, req matrixio.Message, plan, owed []string) (taken int) {
 	for ctx.Err() == nil {
 		busy := w.busyBots()
 		pending := slices.DeleteFunc(slices.Clone(owed), func(b string) bool { return slices.Contains(busy, b) })
@@ -687,7 +759,10 @@ func (o *Orchestrator) turns(ctx context.Context, w *worker, epoch int64, req ma
 			next = plan[0]
 		default:
 			o.log.Debug("turn decision: nobody speaks", "room", w.id, "bot_turns", w.state.BotTurns, "busy", busy)
-			return
+			if w.maxBotTurns > 0 && w.state.BotTurns >= w.state.Limit(w.maxBotTurns) {
+				o.offerContinue(ctx, w, epoch)
+			}
+			return taken
 		}
 		owed = slices.DeleteFunc(owed, func(b string) bool { return b == next })
 		o.log.Debug("turn decision", "room", w.id, "next", next, "owed", owed, "continuation", continuation, "bot_turns", w.state.BotTurns)
@@ -698,6 +773,7 @@ func (o *Orchestrator) turns(ctx context.Context, w *worker, epoch int64, req ma
 			// A reply, or a hand-off to the background: the bot took its turn.
 			w.state.BotSpoke(next, continuation)
 			trig = o.botTrigger(w, next, text, out == backgrounded)
+			taken++
 		}
 		// The floor is free: post results that ended meanwhile.
 		if t, ok := o.results(ctx, w); ok {
@@ -709,7 +785,7 @@ func (o *Orchestrator) turns(ctx context.Context, w *worker, epoch int64, req ma
 			// bot-to-bot exchange.
 			busy := w.busyBots()
 			if continuation || !slices.ContainsFunc(owed, func(b string) bool { return !slices.Contains(busy, b) }) {
-				return
+				return taken
 			}
 			continue
 		}
@@ -719,9 +795,10 @@ func (o *Orchestrator) turns(ctx context.Context, w *worker, epoch int64, req ma
 		st.Owed = slices.DeleteFunc(slices.Clone(owed), func(b string) bool { return slices.Contains(st.Busy, b) })
 		var ok bool
 		if plan, ok = o.decide(ctx, w, epoch, st, trig); !ok {
-			return
+			return taken
 		}
 	}
+	return taken
 }
 
 // decide asks the room's decider for a plan. ok is false when the chain
