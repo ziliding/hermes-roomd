@@ -436,6 +436,10 @@ func (o *Orchestrator) botTrigger(w *worker, bot, text string, handoff bool) tur
 // command runs one user command on the room's worker.
 func (o *Orchestrator) command(ctx context.Context, w *worker, q queued) {
 	log := o.log.With("room", w.id, "cmd", q.cmd.Kind)
+	if q.cmd.Kind == commands.Continue {
+		o.continueChat(ctx, w, q)
+		return
+	}
 	w.state.UserSpoke()
 	switch q.cmd.Kind {
 	case commands.Reset:
@@ -477,6 +481,61 @@ func (o *Orchestrator) command(ctx context.Context, w *worker, q queued) {
 			w.state.BotSpoke(bot, false)
 		}
 	}
+}
+
+// continueChat runs /continue: another round of bot-to-bot continuation
+// from the latest message, which must be a bot's. The command is not
+// conversation, so the turn state is not reset as for a user message: the
+// bot that spoke last still can't answer itself. Only the count starts over,
+// against the room's cap or the one given. A user message stops the round
+// like any chain.
+func (o *Orchestrator) continueChat(ctx context.Context, w *worker, q queued) {
+	log := o.log.With("room", w.id, "cmd", q.cmd.Kind)
+	n, err := commands.ContinueTurns(*q.cmd)
+	if err != nil {
+		o.notice(ctx, w, "!continue: "+err.Error()+", e.g. !continue 4.")
+		return
+	}
+	latest, err := o.store.Since(ctx, w.id, 0, 1)
+	if err != nil {
+		log.Error("reading the latest message", "err", err)
+		return
+	}
+	var p *roster.Person
+	if len(latest) > 0 {
+		p, _ = w.roster.ByMXID(latest[0].Sender)
+	}
+	if p == nil || !p.IsBot {
+		log.Info("continue: the latest message is not a bot's")
+		o.notice(ctx, w, "!continue: nothing to continue; the latest message isn't from a character.")
+		return
+	}
+	w.state = turns.State{LastBot: p.Key, Cap: n}
+	trig := o.botTrigger(w, p.Key, latest[0].Body, false)
+	st := w.state
+	st.Busy = w.busyBots()
+	plan, ok := o.decide(ctx, w, q.epoch, st, trig)
+	if !ok {
+		return
+	}
+	if len(plan) == 0 {
+		// The user asked for more, so the first turn is not left to the
+		// router's sense that the exchange is over (or waits on the user):
+		// a free bot other than the last speaker carries on. Later turns are
+		// planned as usual and may end the round.
+		for _, b := range w.botKeys {
+			if b != p.Key && !slices.Contains(st.Busy, b) {
+				plan = []string{b}
+				break
+			}
+		}
+	}
+	log.Info("continue", "after", p.Key, "cap", n, "plan", plan)
+	if len(plan) == 0 {
+		o.notice(ctx, w, "!continue: no other character is free to carry on right now.")
+		return
+	}
+	o.turns(ctx, w, q.epoch, q.msg, plan, nil)
 }
 
 // notice posts roomd's own status text as the room's notifier (its listener).

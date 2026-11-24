@@ -232,6 +232,8 @@ func TestPlanAgainstServer(t *testing.T) {
 		{"busy pick means nobody", 200, plan("Cleo"), 0, turns.State{BotTurns: 1, LastBot: "ada", Busy: []string{"cleo"}}, adaSpoke, nil, 1, 0},
 		{"a question that waits for the user stops continuation", 200, `{"addressed_to":"user","user_question_pending":true,"plan":["Cleo"]}`, 0, afterAda, adaSpoke, nil, 1, 0},
 		{"cap reached: no call, nobody", 200, plan("Cleo"), 0, turns.State{BotTurns: 2, LastBot: "ada"}, adaSpoke, nil, 0, 0},
+		{"!continue cap raises the limit", 200, plan("Cleo"), 0, turns.State{BotTurns: 2, LastBot: "ada", Cap: 3}, adaSpoke, []string{"cleo"}, 1, 0},
+		{"!continue cap reached: no call, nobody", 200, plan("Cleo"), 0, turns.State{BotTurns: 3, LastBot: "ada", Cap: 3}, adaSpoke, nil, 0, 0},
 		{"malformed output between bots means nobody", 200, `I think Cleo.`, 0, afterAda, adaSpoke, nil, 1, 0},
 		{"old single-speaker shape between bots means nobody", 200, `{"next": "Cleo"}`, 0, afterAda, adaSpoke, nil, 1, 0},
 		{"malformed output for a user message falls back", 200, `I think Cleo.`, 0, turns.State{}, userSpoke, []string{"bram"}, 1, 1},

@@ -16,8 +16,9 @@
 //   - while exactly one bot still owes the user a reply, it speaks, with no
 //     call; while several do, the model only orders them and cannot drop any
 //     (the orchestrator keeps the obligations);
-//   - the bot-to-bot cap (MaxBotTurns) is checked before any call for a
-//     continuation turn, and user_question_pending only stops continuation;
+//   - the bot-to-bot cap (MaxBotTurns, or State.Cap after !continue n) is
+//     checked before any call for a continuation turn, and
+//     user_question_pending only stops continuation;
 //   - names are validated: unknown, busy, and (for continuation) the bot
 //     that just spoke are dropped;
 //   - if the call fails or times out, the fallback Decider (turns.Rules)
@@ -106,8 +107,8 @@ func (r *Router) Plan(ctx context.Context, st turns.State, t turns.Trigger) ([]s
 		switch {
 		case len(st.Owed) == 1:
 			return st.Owed, nil
-		case len(st.Owed) == 0 && st.BotTurns >= r.o.MaxBotTurns:
-			log.Debug("router: bot-turn cap reached; waiting for the user", "bot_turns", st.BotTurns)
+		case len(st.Owed) == 0 && st.BotTurns >= st.Limit(r.o.MaxBotTurns):
+			log.Debug("router: bot-turn cap reached; waiting for the user", "bot_turns", st.BotTurns, "cap", st.Limit(r.o.MaxBotTurns))
 			return nil, nil
 		}
 	}
@@ -282,7 +283,7 @@ func (r *Router) UserPrompt(st turns.State, t turns.Trigger, entries []transcrip
 		fmt.Fprintf(&b, "Still owe %s a reply to their latest message: %s.\n", user, strings.Join(owed, ", "))
 	} else if !t.FromUser {
 		fmt.Fprintf(&b, "Nobody owes %s a reply. Characters have replied to each other %d time(s) since %s last wrote; at most %d are allowed.\n",
-			user, st.BotTurns, user, r.o.MaxBotTurns)
+			user, st.BotTurns, user, st.Limit(r.o.MaxBotTurns))
 	}
 	b.WriteString(r.participation(entries))
 	if busy := r.names(st.Busy); len(busy) > 0 {

@@ -22,6 +22,9 @@ func TestParse(t *testing.T) {
 		{"/explain Cleo", &Command{Kind: Explain, Arg: "Cleo"}},
 		{"/Explain   @cleo:z ", &Command{Kind: Explain, Arg: "@cleo:z"}},
 		{"/explain\tCleo", &Command{Kind: Explain, Arg: "Cleo"}},
+		{"!continue", &Command{Kind: Continue}},
+		{"/Continue 5 ", &Command{Kind: Continue, Arg: "5"}},
+		{"/continuing", nil},
 		{"/resetting", nil},
 		{"/shrug", nil},
 		{"reset", nil},
@@ -33,6 +36,29 @@ func TestParse(t *testing.T) {
 		got, ok := Parse(tt.in)
 		if (tt.want != nil) != ok || (ok && got != *tt.want) {
 			t.Errorf("Parse(%q) = %+v, %v; want %+v", tt.in, got, ok, tt.want)
+		}
+	}
+}
+
+func TestContinueTurns(t *testing.T) {
+	tests := []struct {
+		arg     string
+		want    int
+		wantErr bool
+	}{
+		{"", 0, false},
+		{"1", 1, false},
+		{"4 more please", 4, false},
+		{"20", MaxContinue, false},
+		{"21", 0, true},
+		{"0", 0, true},
+		{"-2", 0, true},
+		{"more", 0, true},
+	}
+	for _, tt := range tests {
+		got, err := ContinueTurns(Command{Kind: Continue, Arg: tt.arg})
+		if got != tt.want || (err != nil) != tt.wantErr {
+			t.Errorf("ContinueTurns(%q) = %d, %v; want %d, err %v", tt.arg, got, err, tt.want, tt.wantErr)
 		}
 	}
 }

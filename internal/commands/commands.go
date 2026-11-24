@@ -12,14 +12,16 @@
 //
 // Only the configured user can run commands. The orchestrator handles them
 // before the turn engine and never records them as conversation. The
-// documented form is "!reset" / "!explain", because Element intercepts unknown
-// slash commands with an "Unrecognised command" dialog; "/reset" and
-// "/explain" are accepted too.
+// documented form is "!reset" / "!explain" / "!continue", because Element
+// intercepts unknown slash commands with an "Unrecognised command" dialog;
+// the "/" forms are accepted too.
 package commands
 
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/ziliding/hermes-roomd/internal/roster"
@@ -29,14 +31,15 @@ import (
 type Kind string
 
 const (
-	Reset   Kind = "reset"
-	Explain Kind = "explain"
+	Reset    Kind = "reset"
+	Explain  Kind = "explain"
+	Continue Kind = "continue"
 )
 
 // Command is one parsed command.
 type Command struct {
 	Kind Kind
-	Arg  string // /explain's optional bot name, trimmed; "" otherwise
+	Arg  string // /explain's optional bot name or /continue's count, trimmed; "" otherwise
 	// FormattedBody is the event's HTML body, for resolving an Element pill
 	// in /explain's argument.
 	FormattedBody string
@@ -60,6 +63,8 @@ func Parse(body string) (Command, bool) {
 		return Command{Kind: Reset}, true
 	case Explain:
 		return Command{Kind: Explain, Arg: rest}, true
+	case Continue:
+		return Command{Kind: Continue, Arg: rest}, true
 	}
 	return Command{}, false
 }
@@ -77,6 +82,24 @@ func RunReset(ctx context.Context, s ResetStore, roomID string, bots []string, u
 
 // ResetNotice is the acknowledgement posted in the room after /reset.
 const ResetNotice = "Reset: every character starts a fresh group conversation from here and won't see the messages above."
+
+// MaxContinue is the most replies one /continue may grant, so a typo
+// ("!continue 500") can't run up a long, costly exchange.
+const MaxContinue = 20
+
+// ContinueTurns reads /continue's optional count. 0 means none was given:
+// the room's max_bot_turns applies.
+func ContinueTurns(c Command) (int, error) {
+	if c.Arg == "" {
+		return 0, nil
+	}
+	word, _, _ := strings.Cut(c.Arg, " ")
+	n, err := strconv.Atoi(word)
+	if err != nil || n < 1 || n > MaxContinue {
+		return 0, fmt.Errorf("the count must be a number from 1 to %d", MaxContinue)
+	}
+	return n, nil
+}
 
 // ErrNoTarget means /explain had no bot argument and no bot has spoken yet.
 var ErrNoTarget = errors.New("no bot has spoken in this room yet")

@@ -11,7 +11,8 @@
 //     it speaks next. Obligations are not capped.
 //   - Continuation: once nobody owes the user anything, bots may react to
 //     each other, at most MaxBotTurns times (State.BotTurns) until the user
-//     speaks again.
+//     speaks again. The user's !continue [n] grants another round: it
+//     resets BotTurns and sets State.Cap to n for that round only.
 package turns
 
 import (
@@ -31,6 +32,17 @@ type State struct {
 	// message (busy ones left out). The orchestrator fills it before every
 	// decision after a bot message.
 	Owed []string
+	// Cap, when > 0, replaces the decider's MaxBotTurns until the user next
+	// speaks. !continue n sets it; 0 keeps the configured cap.
+	Cap int
+}
+
+// Limit is the bot-to-bot cap in force: Cap when set, else maxBotTurns.
+func (s State) Limit(maxBotTurns int) int {
+	if s.Cap > 0 {
+		return s.Cap
+	}
+	return maxBotTurns
 }
 
 // IsBusy reports whether bot is in Busy.
@@ -77,7 +89,8 @@ type Decider interface {
 //     named; one addressed to the group is owed by every bot; otherwise by
 //     one random bot;
 //   - while bots still owe the user, they speak in random order;
-//   - after MaxBotTurns continuation replies, nobody speaks until the user does;
+//   - after MaxBotTurns continuation replies (State.Cap when set), nobody
+//     speaks until the user does;
 //   - otherwise a bot named in the last message continues, or a random bot,
 //     never the one that just spoke.
 type Rules struct {
@@ -104,7 +117,7 @@ func (r *Rules) Plan(_ context.Context, st State, t Trigger) ([]string, error) {
 		r.Rand.Shuffle(len(owed), func(i, j int) { owed[i], owed[j] = owed[j], owed[i] })
 		return owed, nil
 	}
-	if st.BotTurns >= r.MaxBotTurns {
+	if st.BotTurns >= st.Limit(r.MaxBotTurns) {
 		return nil, nil
 	}
 	for _, a := range t.Addressees {

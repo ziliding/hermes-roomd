@@ -218,3 +218,83 @@ func TestResetDuringSlowDecision(t *testing.T) {
 		t.Fatalf("post-reset call %+v", c)
 	}
 }
+
+func (h *harness) speakers() []string {
+	var out []string
+	for _, c := range h.calls {
+		out = append(out, c.bot)
+	}
+	return out
+}
+
+func TestContinue(t *testing.T) {
+	h := newHarness(t, 1, func(bot string, n int) string { return "reply " + bot })
+	h.runCmd(h.user("!continue"))
+	if len(h.calls) != 0 || len(h.notices) != 1 || !strings.Contains(h.notices[0], "nothing to continue") {
+		t.Fatalf("continue with no bot message: calls=%d notices=%v", len(h.calls), h.notices)
+	}
+
+	h.runOne("Cleo, hi") // cleo owes the reply; ada continues once (max_bot_turns 1)
+	if len(h.calls) != 2 {
+		t.Fatalf("setup calls %v", h.speakers())
+	}
+	h.o.Handle(context.Background(), h.user("hmm")) // recorded, its chain never runs:
+	<-h.o.rooms[roomID].inbox                       // the latest message is the user's
+	h.runCmd(h.user("!continue"))
+	if len(h.calls) != 2 || !strings.Contains(h.notices[len(h.notices)-1], "nothing to continue") {
+		t.Fatalf("continue after a user message ran %v", h.speakers())
+	}
+
+	last := h.calls[len(h.calls)-1].bot
+	h.o.Handle(context.Background(), matrixio.Message{RoomID: roomID, EventID: "$b1", Sender: "@" + last + ":z", Body: "and another thing", TS: 1})
+	before := h.latestSeq()
+	h.runCmd(h.user("!continue")) // another round of the room's cap: one reply, from the other bot
+	other := map[string]string{"ada": "cleo", "cleo": "ada"}[last]
+	if got := h.speakers()[2:]; len(got) != 1 || got[0] != other {
+		t.Fatalf("!continue after %s: %v", last, got)
+	}
+	if h.latestSeq() != before+1 {
+		t.Fatalf("seq %d → %d: the command was recorded or the reply wasn't", before, h.latestSeq())
+	}
+
+	h.runCmd(h.user("/continue 3")) // three more, alternating
+	if got := h.speakers()[3:]; len(got) != 3 || got[0] != last || got[1] != other || got[2] != last {
+		t.Fatalf("!continue 3: %v", got)
+	}
+
+	h.runCmd(h.user("!continue lots"))
+	if len(h.calls) != 6 || !strings.Contains(h.notices[len(h.notices)-1], "from 1 to 20") {
+		t.Fatalf("bad count: calls=%d notices=%v", len(h.calls), h.notices)
+	}
+
+	h.runOne("Ada?") // the user speaks: the !continue cap is gone, back to 1
+	if got := h.speakers()[6:]; len(got) != 2 {
+		t.Fatalf("after the user spoke: %v", got)
+	}
+	if c := h.o.rooms[roomID].state.Cap; c != 0 {
+		t.Fatalf("cap %d survived a user message", c)
+	}
+}
+
+// quietDecider answers the user with ada and never continues between bots,
+// like a router that judges the exchange over.
+type quietDecider struct{}
+
+func (quietDecider) Plan(_ context.Context, _ turns.State, t turns.Trigger) ([]string, error) {
+	if t.FromUser {
+		return []string{"ada"}, nil
+	}
+	return nil, nil
+}
+
+// !continue overrides a decider that would let the exchange end: its first
+// turn goes to the other bot; later turns are the decider's again.
+func TestContinueOverridesAnEmptyFirstPlan(t *testing.T) {
+	h := newHarnessWith(t, harnessOpts{maxTurns: 1, decider: func([]string) turns.Decider { return quietDecider{} }},
+		func(bot string, n int) string { return "reply " + bot })
+	h.runOne("hi")
+	h.runCmd(h.user("!continue 5"))
+	if got := h.speakers(); len(got) != 2 || got[0] != "ada" || got[1] != "cleo" {
+		t.Fatalf("speakers %v, want [ada cleo]", got)
+	}
+}

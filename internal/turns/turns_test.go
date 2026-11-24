@@ -28,6 +28,9 @@ func TestPlan(t *testing.T) {
 		{"addressee equal to last speaker ignored", State{BotTurns: 1, LastBot: "cleo"}, Trigger{Sender: "cleo", Addressees: []string{"cleo"}}, []string{"*"}, "cleo"},
 		{"unknown addressee ignored", State{}, Trigger{FromUser: true, Addressees: []string{"ghost"}}, []string{"*"}, ""},
 		{"no addressee: random, never last speaker", State{BotTurns: 1, LastBot: "bram"}, Trigger{Sender: "bram"}, []string{"*"}, "bram"},
+		{"!continue cap above the configured one: go on", State{BotTurns: 2, LastBot: "ada", Cap: 4}, Trigger{Sender: "ada", Addressees: []string{"cleo"}}, []string{"cleo"}, ""},
+		{"!continue cap reached: stop", State{BotTurns: 4, LastBot: "ada", Cap: 4}, Trigger{Sender: "ada", Addressees: []string{"cleo"}}, nil, ""},
+		{"!continue cap below the configured one: stop", State{BotTurns: 1, LastBot: "ada", Cap: 1}, Trigger{Sender: "ada", Addressees: []string{"cleo"}}, nil, ""},
 		{"cap reached but bots still owe the user: they speak", State{BotTurns: 2, LastBot: "ada", Owed: []string{"cleo"}}, Trigger{Sender: "ada"}, []string{"cleo"}, ""},
 	}
 	for _, tt := range tests {

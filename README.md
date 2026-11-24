@@ -37,9 +37,9 @@ rules) picks the next one from the bots that still owe a reply.
   goes on. A question a bot asks the user in passing doesn't cancel the
   others' replies. `max_bot_turns` doesn't count owed replies.
 - **Then the bots may talk among themselves**, at most `max_bot_turns` times
-  until the user speaks again. With the router on, a bot speaks
-  only if it is addressed or has something new to add, and the exchange
-  stops when the conversation is waiting on the user's answer. With the
+  until the user speaks again (`!continue` grants another round). With the
+  router on, a bot speaks only if it is addressed or has something new to
+  add, and the exchange stops when the conversation is waiting on the user's answer. With the
   router off, a bot the last message names goes next, otherwise a random
   bot (never the one that just spoke). A bot that stays silent ends the
   exchange.
@@ -223,7 +223,8 @@ After a failed call the cursor stays put, so the same delta is offered again.
 
 Only the user can run commands. They are never shown to the bots. `!` is
 the documented form, because Element blocks unknown `/` commands;
-`/reset` and `/explain` also work when a client sends them.
+the `/` forms (`/reset`, `/explain`, `/continue`) also work when a client
+sends them.
 
 - **`!reset`:** every bot in the room starts a fresh Hermes session
   (generation `N+1`; ids are never reused, because Hermes retires deleted
@@ -232,6 +233,14 @@ the documented form, because Element blocks unknown `/` commands;
 - **`!explain [name]`:** the named bot, or the last speaker, explains in
   plain language what is going on and what it wants from the user. It is one
   turn, with no chain after it.
+- **`!continue [n]`:** the bots carry on talking among themselves after they
+  stopped at `max_bot_turns`: up to `n` more replies (default: the room's
+  `max_bot_turns`; at most 20). It picks up from the latest message, which
+  must be a bot's. A bot other than the last speaker always gets the first
+  turn, even if the router thinks the exchange is over (it can still stay
+  silent); after that the usual rules apply, so the round can end early.
+  The extra allowance lasts until you next speak, and your message stops
+  the round like any chain.
 
 ### Group memory (optional)
 
@@ -340,8 +349,8 @@ rooms:
     memory: { bank_id: roomd-lounge, retain: { idle_minutes: 10 } }
 ```
 
-- **Cast:** turns, the router, `!explain`, `!reset`, memory participants and
-  each bot's list of others cover only the room's cast.
+- **Cast:** turns, the router, `!explain`, `!reset`, `!continue`, memory
+  participants and each bot's list of others cover only the room's cast.
 - **Listener:** roomd runs one `/sync` loop per distinct listener. A listener
   only has to be joined to its own rooms. If the top-level listener isn't in
   a room's cast, that room uses its first cast bot.
@@ -482,7 +491,7 @@ internal/contextbuild delta → <msg from="Name"> elements, mention rewriting
 internal/silence      silence-marker detection
 internal/turns        Decider interface and the plain turn rules
 internal/router       LLM router (a turns.Decider that falls back to the rules)
-internal/commands     !reset and !explain parsing
+internal/commands     !reset, !explain and !continue parsing
 internal/media        inline images and MEDIA: tags out of replies; long-text splitting
 internal/hermes       Runs API client (start, poll, steer, stop); hermestest is a fake server
 internal/hindsight    Hindsight HTTP client (recall, retain, banks)
