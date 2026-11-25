@@ -746,8 +746,15 @@ func (o *Orchestrator) chain(ctx context.Context, w *worker, q queued) {
 // returns how many turns a bot took (a reply or a hand-off).
 func (o *Orchestrator) turns(ctx context.Context, w *worker, epoch int64, req matrixio.Message, plan, owed []string) (taken int) {
 	for ctx.Err() == nil {
+		// Checked on every turn, not only when the decider plans: a turn that
+		// ends without a message (silence, failure, a reply discarded by
+		// /reset) goes straight on to the next owed bot without planning.
+		if w.userEpoch.Load() != epoch {
+			o.log.Info("user spoke mid-chain; stopping", "room", w.id)
+			return taken
+		}
 		busy := w.busyBots()
-		pending := slices.DeleteFunc(slices.Clone(owed), func(b string) bool { return slices.Contains(busy, b) })
+		pending :=slices.DeleteFunc(slices.Clone(owed), func(b string) bool { return slices.Contains(busy, b) })
 		next, continuation := "", len(pending) == 0
 		switch {
 		case !continuation:

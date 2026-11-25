@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ziliding/hermes-roomd/internal/commands"
 	"github.com/ziliding/hermes-roomd/internal/matrixio"
@@ -385,5 +386,33 @@ func TestNoContinueButtonBeforeTheCap(t *testing.T) {
 	h.runCmd(h.user("!continue"))
 	if len(h.notices) != 1 || !strings.Contains(h.notices[0], "Ada had nothing to add") {
 		t.Fatalf("notices %v", h.notices)
+	}
+}
+
+// /reset while the first of several owed bots is generating: its reply is
+// discarded, and the next owed bot is not called on its old session either
+// (seen live: a turn without a message skipped the check for a newer user
+// message, so the next bot spoke after the reset point).
+func TestResetStopsTheOwedBotsAfterADiscardedReply(t *testing.T) {
+	h := newHarness(t, 1, func(bot string, n int) string { return "old-session reply " + bot })
+	h.gate = make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.o.Run(ctx)
+
+	h.o.Handle(ctx, h.user("what do you all think?")) // both bots owe a reply
+	waitFor(t, func() bool { h.mu.Lock(); defer h.mu.Unlock(); return len(h.calls) == 1 })
+	h.o.Handle(ctx, h.user("!reset"))
+	h.gate <- struct{}{}
+	waitFor(t, func() bool { h.mu.Lock(); defer h.mu.Unlock(); return len(h.notices) == 1 })
+	select {
+	case h.gate <- struct{}{}: // a second run would take this
+		t.Fatal("the next owed bot was called after /reset")
+	case <-time.After(50 * time.Millisecond):
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.posts) != 0 || len(h.calls) != 1 {
+		t.Fatalf("posted after /reset: posts=%v calls=%d", h.posts, len(h.calls))
 	}
 }
