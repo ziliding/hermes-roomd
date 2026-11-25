@@ -96,3 +96,26 @@ func TestSenderOf(t *testing.T) {
 		}
 	}
 }
+
+func TestLastSegmentBreak(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if got, err := s.LastSegmentBreak(ctx, "!a"); err != nil || got != 0 {
+		t.Fatalf("no breaks: %d, %v", got, err)
+	}
+	for _, b := range []struct {
+		room string
+		seq  int64
+	}{{"!a", 5}, {"!a", 9}, {"!b", 12}} {
+		if err := s.AddSegmentBreak(ctx, b.room, b.seq); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := s.LastSegmentBreak(ctx, "!a"); err != nil || got != 9 {
+		t.Fatalf("LastSegmentBreak(!a) = %d, %v; want 9", got, err)
+	}
+}

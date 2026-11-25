@@ -283,7 +283,8 @@ writes it.** The bots never write to it, and it is separate from each
 profile's own memory.
 
 - **Recall:** at most once per user message, roomd queries the bank with the
-  recent messages. Results above `recall.min_score` go into the bot's user
+  recent messages since the last `!reset` (right after one there is nothing
+  to query with, so the chat you just reset isn't pulled back in). Results above `recall.min_score` go into the bot's user
   message, never the system prompt, as a
   `<memory source="past group chats">` block that the rules tell the bots to
   treat as possibly wrong. Each memory reaches a session at most once. Any

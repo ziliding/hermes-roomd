@@ -229,3 +229,30 @@ func TestRecallQueryIsBounded(t *testing.T) {
 		t.Fatal("silence marker in the query")
 	}
 }
+
+// After /reset the query is built only from the new chat: right after the
+// reset there is nothing to recall from, so the chat the user just reset
+// isn't pulled back in through its retained summary.
+func TestRecallQueryStartsAtTheLastReset(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	add(t, s, "@alex:z", "the old story about the ledger", now)
+	resetAt := add(t, s, "@ada:z", "and the ledger again", now)
+	if err := s.AddSegmentBreak(ctx, room, resetAt); err != nil {
+		t.Fatal(err)
+	}
+	hs := &hsServer{answer: twoMemories}
+	r := newRecall(t, hs, s, time.Second)
+
+	if b, ids := r.Block(ctx, room, "grp-x-ada-g2"); b != "" || ids != nil || hs.count() != 0 {
+		t.Fatalf("recall right after /reset: block=%q ids=%v requests=%d", b, ids, hs.count())
+	}
+	add(t, s, "@alex:z", "tea or coffee?", now)
+	if b, _ := r.Block(ctx, room, "grp-x-ada-g2"); b == "" || hs.count() != 1 {
+		t.Fatalf("no recall for the new chat: requests=%d", hs.count())
+	}
+	if q := hs.requests[0]["query"]; q != "Alex: tea or coffee?" {
+		t.Fatalf("query %q still holds messages from before /reset", q)
+	}
+}

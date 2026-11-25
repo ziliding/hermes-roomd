@@ -349,6 +349,15 @@ func (s *Store) NextSegmentBreak(ctx context.Context, roomID string, after int64
 	return seq.Int64, err
 }
 
+// LastSegmentBreak returns the newest break seq in room (the latest /reset
+// point), or 0 if there is none.
+func (s *Store) LastSegmentBreak(ctx context.Context, roomID string) (int64, error) {
+	var seq sql.NullInt64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT MAX(seq) FROM segment_breaks WHERE room_id = ?`, roomID).Scan(&seq)
+	return seq.Int64, err
+}
+
 func joinIDs(ids []string) string { return strings.Join(ids, "\n") }
 
 func splitIDs(s string) []string {

@@ -3,7 +3,8 @@
 // never write to it, and it is separate from each profile's own memory.
 //
 //   - Recall: before a called bot turn, roomd queries the bank with a short
-//     query built from the recent messages, and adds what comes back to that
+//     query built from the recent messages since the last /reset (none
+//     yet: no recall), and adds what comes back to that
 //     turn's user message as a <memory source="past group chats"> block. The
 //     system message is never touched (it stays byte-identical for the
 //     prompt cache). Every failure is logged and the turn goes ahead without
@@ -39,6 +40,7 @@ type Searcher interface {
 // Transcript is the part of transcript.Store recall reads.
 type Transcript interface {
 	Since(ctx context.Context, roomID string, after int64, limit int) ([]transcript.Entry, error)
+	LastSegmentBreak(ctx context.Context, roomID string) (int64, error)
 }
 
 // RecallOptions configures NewRecall.
@@ -110,7 +112,15 @@ func NewRecall(o RecallOptions) *Recall {
 // again on the retry.
 func (r *Recall) Block(ctx context.Context, roomID, sessionID string) (string, []string) {
 	log := r.o.Log.With("room", roomID, "session", sessionID)
-	recent, err := r.o.Transcript.Since(ctx, roomID, 0, r.o.Window)
+	// Only messages since the last /reset: a query built from the chat the
+	// user just reset would pull that same chat back in from its retained
+	// summary. What came before still comes back when the new chat is about it.
+	after, err := r.o.Transcript.LastSegmentBreak(ctx, roomID)
+	if err != nil {
+		log.Warn("memory: reading the last reset point failed; no recall this turn", "err", err)
+		return "", nil
+	}
+	recent, err := r.o.Transcript.Since(ctx, roomID, after, r.o.Window)
 	if err != nil {
 		log.Warn("memory: reading recent messages failed; no recall this turn", "err", err)
 		return "", nil
